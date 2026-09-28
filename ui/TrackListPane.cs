@@ -49,6 +49,7 @@ namespace Lumen.UI
         public event Action<Track> RemoveRequested;
         public event Action<Track> RevealRequested;
         public event Action<Track> DeleteFileRequested;
+        public event Action CleanInvalidRequested;
         public event Action<string> SortChanged;
         public event Action ShuffleRequested;
         public event Action ImportFilesRequested;
@@ -738,6 +739,12 @@ namespace Lumen.UI
 
             menu.Items.Add(new Separator());
 
+            var clean = new MenuItem { Header = "清理失效文件…" };
+            clean.Click += delegate { Raise(CleanInvalidRequested); };
+            menu.Items.Add(clean);
+
+            menu.Items.Add(new Separator());
+
             var newGroup = new MenuItem { Header = "新建分组…" };
             newGroup.Click += delegate { Raise(NewGroupRequested); };
             menu.Items.Add(newGroup);
@@ -752,7 +759,8 @@ namespace Lumen.UI
             var modes = new[]
             {
                 TrackSorter.Added, TrackSorter.Title, TrackSorter.TitleDesc,
-                TrackSorter.Duration, TrackSorter.DurationDesc, TrackSorter.Format
+                TrackSorter.Duration, TrackSorter.DurationDesc, TrackSorter.Format,
+                TrackSorter.Path
             };
 
             foreach (var mode in modes)

@@ -203,6 +203,7 @@ namespace Lumen.UI
             _listPane.RemoveRequested += delegate (Track t) { RemoveTrack(t); };
             _listPane.RevealRequested += delegate (Track t) { RevealInExplorer(t); };
             _listPane.DeleteFileRequested += delegate (Track t) { DeleteTrackFile(t); };
+            _listPane.CleanInvalidRequested += delegate { CleanInvalidFiles(); };
             _listPane.SortChanged += delegate (string mode)
             {
                 _config.SortMode = mode;
@@ -333,6 +334,54 @@ namespace Lumen.UI
             }
             RebuildView();
             SaveConfig();
+        }
+
+        /// <summary>批量移除（仅从列表移除，不删文件）。</summary>
+        private void RemoveTracks(IList<Track> tracks)
+        {
+            if (tracks == null || tracks.Count == 0 || _group == null) return;
+
+            foreach (var t in tracks)
+            {
+                _group.Tracks.Remove(t);
+                if (_group.ShuffledOrder != null) _group.ShuffledOrder.Remove(t.Path);
+                if (string.Equals(_player.CurrentPath, t.Path, StringComparison.OrdinalIgnoreCase))
+                {
+                    _player.Stop();
+                    _currentIndex = -1;
+                }
+            }
+
+            RebuildView();
+            SaveConfig();
+            _listPane.FlashStatus("已从列表移除 " + tracks.Count + " 首");
+        }
+
+        /// <summary>检测并删除当前分组里已经失效（文件不存在）的曲目。</summary>
+        private void CleanInvalidFiles()
+        {
+            if (_group == null) return;
+
+            var invalid = new List<Track>();
+            foreach (var t in _group.Tracks)
+            {
+                if (string.IsNullOrEmpty(t.Path) || !System.IO.File.Exists(t.Path))
+                    invalid.Add(t);
+            }
+
+            if (invalid.Count == 0)
+            {
+                _listPane.FlashStatus("没有失效的文件");
+                return;
+            }
+
+            if (!Dialogs.Confirm(this, "清理失效文件",
+                    "当前分组有 " + invalid.Count + " 首文件已不存在，是否从列表移除？\n（不会删除任何磁盘文件）",
+                    "清理"))
+                return;
+
+            RemoveTracks(invalid);
+            _listPane.FlashStatus("已清理 " + invalid.Count + " 首失效文件");
         }
 
         /// <summary>右键菜单「删除此文件」：送进回收站（不弹确认），并从列表移除。</summary>
@@ -634,6 +683,13 @@ namespace Lumen.UI
         {
             if (track == null) return;
 
+            // 文件已被删除：不再尝试播放，直接提示，避免解码/打开句柄卡死
+            if (!string.IsNullOrEmpty(track.Path) && !System.IO.File.Exists(track.Path))
+            {
+                _listPane.FlashStatus("文件不存在: " + track.Path);
+                return;
+            }
+
             var index = _view.IndexOf(track);
             var startAt = 0.0;
 
@@ -689,7 +745,35 @@ namespace Lumen.UI
                 }
                 next = 0;
             }
-            PlayTrack(_view[next]);
+
+            // 跳过已失效（文件不存在）的曲目，最多找一圈，避免自动切歌时反复失败或卡死
+            int attempts = _view.Count;
+            while (attempts-- > 0)
+            {
+                var t = _view[next];
+                if (!string.IsNullOrEmpty(t.Path) && System.IO.File.Exists(t.Path))
+                {
+                    PlayTrack(t);
+                    return;
+                }
+
+                next++;
+                if (next >= _view.Count)
+                {
+                    if (_player.Mode == Player.PlayMode.Sequential)
+                    {
+                        _player.Stop();
+                        _listPane.SetPlaying(-1);
+                        UpdateBottomBar();
+                        return;
+                    }
+                    next = 0;
+                }
+            }
+
+            _player.Stop();
+            _listPane.SetPlaying(-1);
+            UpdateBottomBar();
         }
 
         private void PlayPrevious()

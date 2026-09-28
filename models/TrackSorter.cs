@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using Lumen.Models;
 
@@ -6,7 +6,7 @@ namespace Lumen
 {
     /// <summary>
     /// 列表排序（对应 README）：
-    /// 标题 ↑↓ / 时长 ↑↓ / 最近添加 / 文件格式；
+    /// 标题 ↑↓ / 时长 ↑↓ / 最近添加 / 文件格式 / 路径；
     /// 打乱顺序优先（它是一次性操作且会被记住），切排序或重新导入即恢复有序。
     /// </summary>
     public static class TrackSorter
@@ -17,6 +17,7 @@ namespace Lumen
         public const string Duration = "duration";
         public const string DurationDesc = "durationDesc";
         public const string Format = "format";
+        public const string Path = "path";
 
         public static List<Track> Sort(Group group, string mode)
         {
@@ -66,6 +67,9 @@ namespace Lumen
                         return string.Compare(a.Title, b.Title, StringComparison.CurrentCultureIgnoreCase);
                     });
                     break;
+                case Path:
+                    result.Sort((a, b) => string.Compare(a.Path, b.Path, StringComparison.CurrentCultureIgnoreCase));
+                    break;
                 case Added:
                 default:
                     result.Sort((a, b) => a.AddedOrder.CompareTo(b.AddedOrder));
@@ -97,6 +101,7 @@ namespace Lumen
                 case Duration: return "时长 ↑";
                 case DurationDesc: return "时长 ↓";
                 case Format: return "文件格式";
+                case Path: return "路径";
                 case Added:
                 default: return "最近添加";
             }
@@ -111,7 +116,8 @@ namespace Lumen
                 case TitleDesc: return Duration;
                 case Duration: return DurationDesc;
                 case DurationDesc: return Format;
-                case Format: return Added;
+                case Format: return Path;
+                case Path: return Added;
                 default: return Added;
             }
         }

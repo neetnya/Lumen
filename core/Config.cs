@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
@@ -31,7 +31,7 @@ namespace Lumen
         public bool WindowMaximized;
 
         // ---- 列表 ----
-        public string SortMode = "added";          // added / title / titleDesc / duration / durationDesc / format
+        public string SortMode = "added";          // added / title / titleDesc / duration / durationDesc / format / path
         public string CurrentGroupId;
 
         // ---- 桌面歌词 ----
