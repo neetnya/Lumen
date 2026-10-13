@@ -35,6 +35,7 @@ namespace Lumen.UI
         private LyricsDocument _doc;
         private int _currentIndex = -1;
         private bool _locked;
+        private bool _isPlaying;
         private double _fontScale = 1.0;
 
         private readonly DispatcherTimer _ticker;
@@ -200,7 +201,7 @@ namespace Lumen.UI
                 return;
             }
 
-            UpdatePosition(0);
+            if (_isPlaying) UpdatePosition(0);
         }
 
         /// <summary>更新当前行（切句瞬间生效，不做垂直滚动动画）。</summary>
@@ -223,6 +224,33 @@ namespace Lumen.UI
 
             _currentIndex = index;
             ShowLine(_doc.Lines[index].Text);
+        }
+
+        /// <summary>设置播放状态：暂停时不显示歌词（清空文字），继续时恢复。</summary>
+        public void SetPlaying(bool playing)
+        {
+            if (_isPlaying == playing) return;
+            _isPlaying = playing;
+
+            if (!playing)
+            {
+                // 暂停：清空显示（跑马灯也停）
+                _text.Text = string.Empty;
+                _marquee.Stop();
+                LayoutText();
+                return;
+            }
+
+            // 恢复播放：重新显示当前句
+            if (_doc == null || _doc.IsEmpty) return;
+            if (_currentIndex >= 0 && _currentIndex < _doc.Lines.Count)
+            {
+                ShowLine(_doc.Lines[_currentIndex].Text);
+            }
+            else
+            {
+                UpdatePosition(0);
+            }
         }
 
         private void ShowLine(string text)

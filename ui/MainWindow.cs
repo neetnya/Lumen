@@ -1316,6 +1316,8 @@ namespace Lumen.UI
                 if (!_player.HasTrack)
                 {
                     UpdateBottomBar();
+                    if (_desktopLyrics != null && _config.DesktopLyricsVisible)
+                        _desktopLyrics.SetPlaying(false);
                     return;
                 }
 
@@ -1335,7 +1337,11 @@ namespace Lumen.UI
                 _lyricsPane.UpdatePosition(position, true);
 
                 if (_desktopLyrics != null && _config.DesktopLyricsVisible)
-                    _desktopLyrics.UpdatePosition(position);
+                {
+                    _desktopLyrics.SetPlaying(_player.IsPlaying);
+                    if (_player.IsPlaying)
+                        _desktopLyrics.UpdatePosition(position);
+                }
 
 
                 // 分组进度定期落盘（每 5 秒），避免频繁写文件
