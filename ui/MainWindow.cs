@@ -518,8 +518,6 @@ namespace Lumen.UI
                         var group = new Group
                         {
                             Name = string.IsNullOrEmpty(groupName) ? "新分组" : groupName,
-                            FromFolder = true,
-                            SourceFolder = folderPath,
                             Tracks = tracks
                         };
                         _config.Groups.Add(group);
