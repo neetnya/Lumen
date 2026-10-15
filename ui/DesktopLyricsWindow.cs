@@ -38,7 +38,6 @@ namespace Lumen.UI
         private bool _isPlaying;
         private double _fontScale = 1.0;
 
-        private readonly DispatcherTimer _ticker;
         private readonly DispatcherTimer _marquee;
 
         private double _marqueeOffset;
@@ -54,9 +53,7 @@ namespace Lumen.UI
         public event Action<double, double, double> PositionChanged;
         public event Action<bool> LockChanged;
         public event Action<double> FontScaleChanged;
-
-        /// <summary>当前播放位置由主窗口推入。</summary>
-        public event Action<double> RequestPosition;
+        public event Action HiddenRequested;
 
         public DesktopLyricsWindow()
         {
@@ -90,13 +87,6 @@ namespace Lumen.UI
             // 背景框彻底去掉：Canvas 直接作为窗口内容，
             // 桌面上只浮着歌词文字，不再有任何底板/边框。
             Content = _canvas;
-
-            _ticker = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(50) };
-            _ticker.Tick += delegate
-            {
-                var handler = RequestPosition;
-                if (handler != null) handler(0);
-            };
 
             _marquee = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(16) };
             _marquee.Tick += OnMarqueeTick;
@@ -482,7 +472,12 @@ namespace Lumen.UI
             menu.Items.Add(new Separator());
 
             var hide = new MenuItem { Header = "隐藏桌面歌词" };
-            hide.Click += delegate { Hide(); };
+            hide.Click += delegate
+            {
+                var handler = HiddenRequested;
+                if (handler != null) handler();
+                else Hide();
+            };
             menu.Items.Add(hide);
 
             menu.PlacementTarget = this;
@@ -505,17 +500,14 @@ namespace Lumen.UI
             if (handler != null) handler(_fontScale);
         }
 
-        /// <summary>主窗口定时调用：刷新当前句。</summary>
+        /// <summary>主窗口定时调用：位置已由 TickPlayback 推入，这里不再自己轮询。</summary>
         public void SetTickerEnabled(bool enabled)
         {
-            if (enabled) { if (!_ticker.IsEnabled) _ticker.Start(); }
-            else _ticker.Stop();
         }
 
         protected override void OnClosed(EventArgs e)
         {
             base.OnClosed(e);
-            _ticker.Stop();
             _marquee.Stop();
         }
     }

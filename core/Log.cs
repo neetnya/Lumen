@@ -40,6 +40,21 @@ namespace Lumen
             Write("ERROR", text);
         }
 
+        private const long MaxLogBytes = 2 * 1024 * 1024;
+
+        private static void RotateIfNeeded()
+        {
+            try
+            {
+                var info = new FileInfo(Path);
+                if (!info.Exists || info.Length < MaxLogBytes) return;
+                var bak = Path + ".1";
+                if (File.Exists(bak)) File.Delete(bak);
+                File.Move(Path, bak);
+            }
+            catch { }
+        }
+
         private static void Write(string level, string message)
         {
             try
@@ -48,6 +63,7 @@ namespace Lumen
                 {
                     var dir = System.IO.Path.GetDirectoryName(Path);
                     if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                    RotateIfNeeded();
                     var line = string.Format("{0:yyyy-MM-dd HH:mm:ss.fff} [{1}] {2}{3}",
                         DateTime.Now, level, message, Environment.NewLine);
                     File.AppendAllText(Path, line, Encoding.UTF8);

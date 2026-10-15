@@ -683,6 +683,8 @@ namespace Lumen.UI
             };
         }
 
+        private int _playGeneration;
+
         private void PlayTrack(Track track)
         {
             if (track == null) return;
@@ -697,20 +699,28 @@ namespace Lumen.UI
             var index = _view.IndexOf(track);
             var startAt = 0.0;
 
-            // 同一首再次点击则从头播放
+            // 同一首再次双击则从头播放
             if (index >= 0 && string.Equals(_player.CurrentPath, track.Path, StringComparison.OrdinalIgnoreCase))
                 startAt = 0;
 
-
-            if (_player.Play(track.Path, startAt))
+            // 解码放后台，避免难文件把界面卡住
+            int gen = System.Threading.Interlocked.Increment(ref _playGeneration);
+            string path = track.Path;
+            System.Threading.ThreadPool.QueueUserWorkItem(delegate
             {
-                _currentIndex = index;
-                _lastKnownPosition = startAt;
-                _playbackEnded = false;
-                _listPane.SetPlaying(index);
-                LoadLyricsFor(track.Path);
-                UpdateBottomBar();
-            }
+                bool ok = _player.Play(path, startAt);
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (gen != _playGeneration) return;
+                    if (!ok) return;
+                    _currentIndex = index;
+                    _lastKnownPosition = startAt;
+                    _playbackEnded = false;
+                    _listPane.SetPlaying(index);
+                    LoadLyricsFor(path);
+                    UpdateBottomBar();
+                }));
+            });
         }
 
         private void TogglePlayPause()
@@ -932,6 +942,12 @@ namespace Lumen.UI
                 _config.DesktopLyricsFontScale = scale;
                 SaveConfig();
             };
+            window.HiddenRequested += delegate
+            {
+                _config.DesktopLyricsVisible = false;
+                SyncDesktopLyrics();
+                SaveConfig();
+            };
         }
 
         private void SyncDesktopLyrics()
@@ -1055,21 +1071,6 @@ namespace Lumen.UI
         {
             SaveGroupProgress();
             _config.Save();
-        }
-
-        private void SaveConfigSoon()
-        {
-            // 播放进度频繁变化，做一次 1.5 秒的防抖
-            var timer = new System.Windows.Threading.DispatcherTimer
-            {
-                Interval = TimeSpan.FromMilliseconds(1500)
-            };
-            timer.Tick += delegate
-            {
-                timer.Stop();
-                SaveConfig();
-            };
-            timer.Start();
         }
 
         private void UpdateModeButton()
@@ -1357,7 +1358,7 @@ namespace Lumen.UI
                 {
                     _lastProgressSave = DateTime.UtcNow;
                     SaveGroupProgress();
-                    _config.Save();
+                    _config.SaveAsync();
                 }
             }
             catch (Exception ex)

@@ -145,8 +145,8 @@ namespace Lumen
                     var temp = path + ".tmp";
                     File.WriteAllText(temp, json, new UTF8Encoding(false));
 
-                    if (File.Exists(path)) File.Delete(path);
-                    File.Move(temp, path);
+                    if (File.Exists(path)) File.Replace(temp, path, null);
+                    else File.Move(temp, path);
                     return true;
                 }
                 catch (Exception ex)
