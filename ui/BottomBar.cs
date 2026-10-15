@@ -11,7 +11,7 @@ namespace Lumen.UI
     /// <summary>
     /// 底部播放进度区：
     /// 圆形播放/暂停键、上一首/下一首、播放模式、可点击跳转的进度条、
-    /// 音量与静音、专辑封面与曲目信息。
+    /// 音量与静音、曲目信息。
     /// </summary>
     public sealed class BottomBar : Grid
     {
@@ -26,7 +26,6 @@ namespace Lumen.UI
         private readonly TextBlock _subtitle;
         private readonly TextBlock _time;
         private readonly TextBlock _volumePercent;
-        private readonly Border _cover;
 
         private bool _isPlaying;
         private int _mode;
@@ -87,28 +86,15 @@ namespace Lumen.UI
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             row.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
 
-            // 左：封面 + 曲目信息
-            // 用 Grid（星号列）而不是 StackPanel：这样文本能拿到确定宽度，
-            // TextTrimming 才会真的生效，也就不会把中间按钮挤偏。
+            // 左：曲目信息。用 Grid 星号列拿确定宽度，TextTrimming 才会生效，
+            // 歌名再长也不会把中间播放按钮挤偏。
             var left = new Grid { VerticalAlignment = VerticalAlignment.Center };
-            left.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             left.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
-
-            _cover = new Border
-            {
-                Width = 48,
-                Height = 48,
-                CornerRadius = new CornerRadius(6),
-                Background = Theme.Brush("Brush.Raised"),
-                Child = Icons.Create(Icons.Music, 20, null, Theme.Brush("Brush.TextFaint"), 1.4)
-            };
-            Grid.SetColumn(_cover, 0);
-            left.Children.Add(_cover);
 
             var info = new Grid
             {
                 VerticalAlignment = VerticalAlignment.Center,
-                Margin = new Thickness(12, 0, 12, 0)
+                Margin = new Thickness(0, 0, 12, 0)
             };
             info.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             info.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
@@ -135,7 +121,7 @@ namespace Lumen.UI
             info.Children.Add(_title);
             info.Children.Add(_subtitle);
 
-            Grid.SetColumn(info, 1);
+            Grid.SetColumn(info, 0);
             left.Children.Add(info);
 
             Grid.SetColumn(left, 0);

@@ -71,8 +71,6 @@ namespace Lumen
 
         public static string ConfigFile { get { return Path.Combine(DataDir, "library.json"); } }
 
-        public static string CoversDir { get { return Path.Combine(DataDir, "covers"); } }
-
         public static string SelftestResultFile { get { return Path.Combine(DataDir, "selftest-result.json"); } }
 
         /// <summary>用于测试：覆盖数据目录。</summary>
