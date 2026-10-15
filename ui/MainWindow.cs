@@ -479,11 +479,13 @@ namespace Lumen.UI
             bool createNew = true;
             if (_group != null)
             {
-                createNew = Dialogs.Confirm(this,
+                var choice = Dialogs.Choose(this,
                     "导入文件夹",
-                    "把「" + name + "」作为新分组，还是并入当前分组「" + _group.Name + "」？\n\n" +
-                    "确定 = 新建分组，取消 = 并入当前分组",
-                    "新建分组");
+                    "把「" + name + "」作为新分组，还是并入当前分组「" + _group.Name + "」？",
+                    "新建分组",
+                    "并入当前分组");
+                if (choice == null) return;
+                createNew = choice == true;
             }
 
             var order = NextAddedOrder();

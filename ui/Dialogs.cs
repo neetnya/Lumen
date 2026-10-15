@@ -36,6 +36,73 @@ namespace Lumen.UI
             return Show(owner, title, message, Kind.Question, true, okText);
         }
 
+        /// <summary>
+        /// 两个操作按钮。点主按钮返回 true，点次按钮返回 false，关掉窗口返回 null。
+        /// </summary>
+        public static bool? Choose(Window owner, string title, string message, string primaryText, string secondaryText)
+        {
+            var window = CreateWindow(owner, title, 400, 200);
+            bool? result = null;
+
+            var root = new Grid { Margin = new Thickness(22, 20, 22, 16) };
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var head = new StackPanel { Orientation = Orientation.Horizontal };
+            head.Children.Add(BuildIcon(Kind.Question));
+            head.Children.Add(new TextBlock
+            {
+                Text = title,
+                FontSize = 14,
+                FontWeight = FontWeights.SemiBold,
+                Foreground = Theme.Brush("Brush.Text"),
+                VerticalAlignment = VerticalAlignment.Center,
+                Margin = new Thickness(10, 0, 0, 0)
+            });
+            Grid.SetRow(head, 0);
+            root.Children.Add(head);
+
+            var body = new TextBlock
+            {
+                Text = message ?? "",
+                TextWrapping = TextWrapping.Wrap,
+                Foreground = Theme.Brush("Brush.TextDim"),
+                LineHeight = 20,
+                Margin = new Thickness(0, 12, 0, 0)
+            };
+            Grid.SetRow(body, 1);
+            root.Children.Add(body);
+
+            var buttons = new StackPanel
+            {
+                Orientation = Orientation.Horizontal,
+                HorizontalAlignment = HorizontalAlignment.Right,
+                Margin = new Thickness(0, 16, 0, 0)
+            };
+            var secondary = MakeButton(secondaryText, false);
+            secondary.Click += delegate
+            {
+                result = false;
+                window.DialogResult = true;
+            };
+            var primary = MakeButton(primaryText, true);
+            primary.Click += delegate
+            {
+                result = true;
+                window.DialogResult = true;
+            };
+            buttons.Children.Add(secondary);
+            buttons.Children.Add(primary);
+            Grid.SetRow(buttons, 2);
+            root.Children.Add(buttons);
+
+            window.Loaded += delegate { primary.Focus(); };
+            WrapContent(window, root);
+            window.ShowDialog();
+            return result;
+        }
+
         /// <summary>文本输入框（新建/重命名分组用），取消返回 null。</summary>
         public static string Prompt(Window owner, string title, string message, string initial)
         {
