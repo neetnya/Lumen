@@ -200,9 +200,9 @@ namespace Lumen.UI
             _listPane = new TrackListPane();
             _listPane.TrackActivated += delegate (Track t) { PlayTrack(t); };
             _listPane.PlayRequested += delegate (Track t) { PlayTrack(t); };
-            _listPane.RemoveRequested += delegate (Track t) { RemoveTrack(t); };
+            _listPane.RemoveRequested += delegate (IList<Track> tracks) { RemoveTracks(tracks); };
             _listPane.RevealRequested += delegate (Track t) { RevealInExplorer(t); };
-            _listPane.DeleteFileRequested += delegate (Track t) { DeleteTrackFile(t); };
+            _listPane.DeleteFileRequested += delegate (IList<Track> tracks) { DeleteTrackFiles(tracks); };
             _listPane.CleanInvalidRequested += delegate { CleanInvalidFiles(); };
             _listPane.SortChanged += delegate (string mode)
             {
@@ -322,20 +322,6 @@ namespace Lumen.UI
             _listPane.SetPlaying(_currentIndexPath());
         }
 
-        private void RemoveTrack(Track track)
-        {
-            if (track == null || _group == null) return;
-            _group.Tracks.Remove(track);
-            if (_group.ShuffledOrder != null) _group.ShuffledOrder.Remove(track.Path);
-            if (string.Equals(_player.CurrentPath, track.Path, StringComparison.OrdinalIgnoreCase))
-            {
-                _player.Stop();
-                _currentIndex = -1;
-            }
-            RebuildView();
-            SaveConfig();
-        }
-
         /// <summary>批量移除（仅从列表移除，不删文件）。</summary>
         private void RemoveTracks(IList<Track> tracks)
         {
@@ -384,31 +370,49 @@ namespace Lumen.UI
             _listPane.FlashStatus("已清理 " + invalid.Count + " 首失效文件");
         }
 
-        /// <summary>右键菜单「删除此文件」：送进回收站（不弹确认），并从列表移除。</summary>
-        private void DeleteTrackFile(Track track)
+        /// <summary>右键菜单「删除此文件」：单首送回收站不确认；多选会先确认。</summary>
+        private void DeleteTrackFiles(IList<Track> tracks)
         {
-            if (track == null || string.IsNullOrEmpty(track.Path)) return;
-            if (!System.IO.File.Exists(track.Path)) return;
+            if (tracks == null || tracks.Count == 0) return;
 
-            var name = System.IO.Path.GetFileName(track.Path);
-
-            // 正在播放就先停掉，避免句柄占用导致删除失败
-            if (string.Equals(_player.CurrentPath, track.Path, StringComparison.OrdinalIgnoreCase))
+            if (tracks.Count > 1)
             {
-                _player.Stop();
-                _currentIndex = -1;
+                if (!Dialogs.Confirm(this, "删除文件",
+                        "将这 " + tracks.Count + " 首送进回收站？\n（可从回收站还原）",
+                        "删除"))
+                    return;
             }
 
-            int result = Native.Win32.DeleteToRecycleBin(track.Path);
-            if (result != 0)
+            int ok = 0;
+            foreach (var track in tracks)
             {
-                Log.Warn("送回收站失败: " + name + " (code " + result + ")");
-                Dialogs.ShowError(this, "删除失败", "无法将文件送进回收站：" + name);
-                return;
+                if (track == null || string.IsNullOrEmpty(track.Path)) continue;
+                if (!System.IO.File.Exists(track.Path)) continue;
+
+                var name = System.IO.Path.GetFileName(track.Path);
+
+                if (string.Equals(_player.CurrentPath, track.Path, StringComparison.OrdinalIgnoreCase))
+                {
+                    _player.Stop();
+                    _currentIndex = -1;
+                }
+
+                int result = Native.Win32.DeleteToRecycleBin(track.Path);
+                if (result != 0)
+                {
+                    Log.Warn("送回收站失败: " + name + " (code " + result + ")");
+                    Dialogs.ShowError(this, "删除失败", "无法将文件送进回收站：" + name);
+                    continue;
+                }
+
+                _group.Tracks.Remove(track);
+                if (_group.ShuffledOrder != null) _group.ShuffledOrder.Remove(track.Path);
+                ok++;
             }
 
-            RemoveTrack(track);
-            _listPane.FlashStatus("已送进回收站：" + name);
+            RebuildView();
+            SaveConfig();
+            if (ok > 0) _listPane.FlashStatus("已送进回收站 " + ok + " 首");
         }
 
         private static void RevealInExplorer(Track track)
@@ -1226,9 +1230,11 @@ namespace Lumen.UI
         {
             // 焦点在文本框 / 密码框等可输入控件里时，方向键与空格属于正常输入/光标操作，交给控件处理。
             var focused = Keyboard.FocusedElement as DependencyObject;
+            bool listFocused = false;
             while (focused != null)
             {
                 if (focused is TextBox || focused is PasswordBox) return;
+                if (focused is ListBox || focused is ListBoxItem) listFocused = true;
                 focused = System.Windows.Media.VisualTreeHelper.GetParent(focused);
             }
 
@@ -1250,11 +1256,13 @@ namespace Lumen.UI
                     break;
 
                 case Key.Up:
+                    if (listFocused) return;
                     NudgeVolume(0.05f);
                     e.Handled = true;
                     break;
 
                 case Key.Down:
+                    if (listFocused) return;
                     NudgeVolume(-0.05f);
                     e.Handled = true;
                     break;

@@ -42,13 +42,14 @@ namespace Lumen.UI
         private List<Group> _groups = new List<Group>();
         private string _currentGroupId;
         private int _playingIndex = -1;
+        private Track _playingTrack;
         private double _numberWidth = 32;
 
         public event Action<Track> TrackActivated;
         public event Action<Track> PlayRequested;
-        public event Action<Track> RemoveRequested;
+        public event Action<IList<Track>> RemoveRequested;
         public event Action<Track> RevealRequested;
-        public event Action<Track> DeleteFileRequested;
+        public event Action<IList<Track>> DeleteFileRequested;
         public event Action CleanInvalidRequested;
         public event Action<string> SortChanged;
         public event Action ShuffleRequested;
@@ -149,7 +150,8 @@ namespace Lumen.UI
                 Background = Brushes.Transparent,
                 BorderThickness = new Thickness(0),
                 Margin = new Thickness(6, 0, 6, 0),
-                HorizontalContentAlignment = HorizontalAlignment.Stretch
+                HorizontalContentAlignment = HorizontalAlignment.Stretch,
+                SelectionMode = SelectionMode.Extended
             };
 
             // 附加属性不能在对象初始化器里设，单独设。
@@ -163,8 +165,8 @@ namespace Lumen.UI
             _list.ItemContainerStyle = BuildItemStyle();
             _list.ItemTemplate = BuildRowTemplate();
 
-            // 单击即切歌
-            _list.PreviewMouseLeftButtonUp += OnListClick;
+            // 单击选中（配合 Ctrl / Shift 多选），双击播放
+            _list.MouseDoubleClick += OnListDoubleClick;
             _list.MouseRightButtonUp += OnListRightClick;
             _list.KeyDown += OnListKeyDown;
 
@@ -314,7 +316,7 @@ namespace Lumen.UI
             style.Setters.Add(new Setter(ListBoxItem.PaddingProperty, new Thickness(0)));
             style.Setters.Add(new Setter(ListBoxItem.MarginProperty, new Thickness(0, 1, 0, 1)));
             style.Setters.Add(new Setter(ListBoxItem.HorizontalContentAlignmentProperty, HorizontalAlignment.Stretch));
-            style.Setters.Add(new Setter(ListBoxItem.FocusableProperty, false));
+            style.Setters.Add(new Setter(ListBoxItem.FocusVisualStyleProperty, null));
             style.Setters.Add(new Setter(ListBoxItem.TemplateProperty, BuildItemTemplate()));
 
             return style;
@@ -337,6 +339,10 @@ namespace Lumen.UI
             var hover = new Trigger { Property = IsMouseOverProperty, Value = true };
             hover.Setters.Add(new Setter(Border.BackgroundProperty, Theme.Brush("Brush.Hover"), "bg"));
             template.Triggers.Add(hover);
+
+            var selected = new Trigger { Property = ListBoxItem.IsSelectedProperty, Value = true };
+            selected.Setters.Add(new Setter(Border.BackgroundProperty, Theme.Brush("Brush.Active"), "bg"));
+            template.Triggers.Add(selected);
 
             return template;
         }
@@ -474,7 +480,7 @@ namespace Lumen.UI
             panel.Children.Add(chevron);
 
             _groupButton.Content = panel;
-            _groupButton.ToolTip = name + "（" + count + " 首）\n点击切换分组，右键管理";
+            _groupButton.ToolTip = name + "（" + count + " 首）\n点击切换或管理分组";
         }
 
         private Group FindCurrentGroup()
@@ -493,25 +499,42 @@ namespace Lumen.UI
         public void SetPlaying(int index)
         {
             _playingIndex = index;
+            _playingTrack = (index >= 0 && index < _tracks.Count) ? _tracks[index] : null;
             UpdatePlayingFlags();
         }
 
         /// <summary>把列表滚动到当前播放的那一行并选中（「定位到当前播放」）。</summary>
         public void ScrollToPlaying()
         {
-            if (_playingIndex < 0 || _playingIndex >= _rows.Count) return;
+            RowItem found = null;
+            foreach (var row in _rows)
+            {
+                if (row.IsPlaying)
+                {
+                    found = row;
+                    break;
+                }
+            }
 
-            var row = _rows[_playingIndex];
-            _list.SelectedItem = row;
-            _list.ScrollIntoView(row);
+            if (found == null)
+            {
+                if (_playingTrack != null && !string.IsNullOrWhiteSpace(_search.Text))
+                    FlashStatus("当前播放的歌曲不在搜索结果里");
+                return;
+            }
+
+            _list.SelectedItem = found;
+            _list.ScrollIntoView(found);
         }
 
-        /// <summary>只更新播放标记，不重建列表（切歌时保证秒切）。</summary>
+        /// <summary>按曲目匹配播放标记，不按可见行下标（搜索过滤后下标会对不上）。</summary>
         private void UpdatePlayingFlags()
         {
             for (int i = 0; i < _rows.Count; i++)
             {
-                _rows[i].IsPlaying = (i == _playingIndex);
+                var track = _rows[i].Track;
+                _rows[i].IsPlaying = _playingTrack != null && track != null &&
+                    string.Equals(track.Path, _playingTrack.Path, StringComparison.OrdinalIgnoreCase);
             }
         }
 
@@ -604,14 +627,14 @@ namespace Lumen.UI
         // 交互
         // ------------------------------------------------------------------
 
-        private void OnListClick(object sender, MouseButtonEventArgs e)
+        private void OnListDoubleClick(object sender, MouseButtonEventArgs e)
         {
             var row = ResolveRow(e.OriginalSource as DependencyObject);
             if (row == null) return;
 
-            // 单击即播放（不再需要双击）
             var handler = TrackActivated;
             if (handler != null) handler(row.Track);
+            e.Handled = true;
         }
 
         private void OnListRightClick(object sender, MouseButtonEventArgs e)
@@ -620,7 +643,8 @@ namespace Lumen.UI
             if (row == null) return;
 
             e.Handled = true;
-            _list.SelectedItem = row;
+            if (!_list.SelectedItems.Contains(row))
+                _list.SelectedItem = row;
             ShowTrackMenu(row.Track, _list);
         }
 
@@ -642,6 +666,22 @@ namespace Lumen.UI
 
         private void OnListKeyDown(object sender, KeyEventArgs e)
         {
+            if (e.Key == Key.A && Keyboard.Modifiers == ModifierKeys.Control)
+            {
+                _list.SelectAll();
+                e.Handled = true;
+                return;
+            }
+
+            if (e.Key == Key.Delete)
+            {
+                var selected = GetSelectedTracks();
+                if (selected.Count == 0) return;
+                Raise(RemoveRequested, selected);
+                e.Handled = true;
+                return;
+            }
+
             if (e.Key != Key.Enter) return;
 
             var row = _list.SelectedItem as RowItem;
@@ -649,32 +689,54 @@ namespace Lumen.UI
 
             var handler = TrackActivated;
             if (handler != null) handler(row.Track);
+            e.Handled = true;
+        }
+
+        private List<Track> GetSelectedTracks()
+        {
+            var result = new List<Track>();
+            foreach (var item in _list.SelectedItems)
+            {
+                var row = item as RowItem;
+                if (row != null && row.Track != null) result.Add(row.Track);
+            }
+            return result;
         }
 
         // ------------------------------------------------------------------
         // 菜单
         // ------------------------------------------------------------------
 
-        private void ShowTrackMenu(Track track, FrameworkElement target)
+        private void ShowTrackMenu(Track clicked, FrameworkElement target)
         {
+            var selected = GetSelectedTracks();
+            if (selected.Count == 0 && clicked != null) selected.Add(clicked);
+
             var menu = new ContextMenu();
 
+            var playTarget = clicked ?? (selected.Count > 0 ? selected[0] : null);
             var play = new MenuItem { Header = "播放" };
-            play.Click += delegate { Raise(PlayRequested, track); };
+            play.Click += delegate { Raise(PlayRequested, playTarget); };
             menu.Items.Add(play);
 
-            var remove = new MenuItem { Header = "从列表移除" };
-            remove.Click += delegate { Raise(RemoveRequested, track); };
+            var remove = new MenuItem
+            {
+                Header = selected.Count > 1 ? "从列表移除 " + selected.Count + " 首" : "从列表移除"
+            };
+            remove.Click += delegate { Raise(RemoveRequested, selected); };
             menu.Items.Add(remove);
 
-            var deleteFile = new MenuItem { Header = "删除此文件" };
-            deleteFile.Click += delegate { Raise(DeleteFileRequested, track); };
+            var deleteFile = new MenuItem
+            {
+                Header = selected.Count > 1 ? "删除这 " + selected.Count + " 个文件" : "删除此文件"
+            };
+            deleteFile.Click += delegate { Raise(DeleteFileRequested, selected); };
             menu.Items.Add(deleteFile);
 
             menu.Items.Add(new Separator());
 
             var reveal = new MenuItem { Header = "在资源管理器中显示" };
-            reveal.Click += delegate { Raise(RevealRequested, track); };
+            reveal.Click += delegate { Raise(RevealRequested, clicked); };
             menu.Items.Add(reveal);
 
             menu.PlacementTarget = target;
@@ -782,6 +844,11 @@ namespace Lumen.UI
         private static void Raise(Action<Track> handler, Track track)
         {
             if (handler != null) handler(track);
+        }
+
+        private static void Raise(Action<IList<Track>> handler, IList<Track> tracks)
+        {
+            if (handler != null) handler(tracks);
         }
 
         private static void Raise(Action handler)
