@@ -112,29 +112,6 @@ dotnet run -c Release
 
 ---
 
-## 常见构建问题
-
-- **NETSDK1022（重复的 Page 项）**：本项目已在 `Lumen.csproj` 中关闭 WPF 默认的 Page / ApplicationDefinition 包含，并显式声明 `App.xaml` 与 `ui\**\*.xaml`。请勿手工改动这两类 `ItemGroup`。
-- **还原报找不到 NAudio**：确认 `NuGet.config` 与 `local-feed\` 目录在同一目录树内且完整；`local-feed\` 必须包含 `naudio.2.2.1.nupkg` 等 11 个包。
-- **首次构建很慢**：正常，首次要还原并编译 WPF XAML。后续增量构建会快很多。
-
----
-
-## 命令行参数
-
-```text
-Lumen.exe [选项] [音频文件或文件夹 ...]
-
-  --selftest [秒数]   内置自检，不显示界面（默认 8 秒）
-  --smoke [秒数]      正常启动界面，若干秒后自动退出（默认 6 秒，用于实机冒烟）
-  --data-dir <目录>   覆盖数据目录
-  --help              显示帮助
-```
-
-从文件关联打开（把音频文件或文件夹作为参数传入）会自动导入并播放。
-
----
-
 ## 内置自检
 
 自检不依赖界面，可用来快速验证「界面能建、音频能解码、歌词能同步、穿透能生效」等核心链路：
