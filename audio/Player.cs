@@ -321,14 +321,43 @@ namespace Lumen.Audio
         {
             if (_stoppingIntentionally || _disposed) return;
 
+            // 忽略旧输出实例延迟到达的停止事件，避免影响新曲目。
+            if (!ReferenceEquals(sender, _output)) return;
+
+            // PlaybackStopped 不一定代表歌曲播放完毕：WASAPI 设备被拔出、
+            // 默认输出设备切换等情况也会停止播放流。只有读取位置确实到达
+            // 曲目末尾，才允许触发自动切歌。
+            bool reachedEnd = false;
+            var reader = _reader;
+            if (reader != null)
+            {
+                try
+                {
+                    var total = reader.TotalTime;
+                    var position = reader.CurrentTime;
+                    reachedEnd = total > TimeSpan.Zero &&
+                                 position >= total - TimeSpan.FromMilliseconds(300);
+                }
+                catch { }
+            }
+
+            if (!reachedEnd)
+            {
+                if (e != null && e.Exception != null)
+                    Log.Error("播放设备或播放流中断；歌曲尚未播放结束，不自动切歌", e.Exception);
+                else
+                    Log.Warn("播放流在歌曲结束前停止；不自动切歌");
+                return;
+            }
+
             if (e != null && e.Exception != null)
             {
-                Log.Error("播放中断", e.Exception);
+                Log.Error("曲目结束时播放流发生异常", e.Exception);
                 RaiseFailed(Describe(e.Exception, _currentPath));
                 return;
             }
 
-            // 自然结束
+            // 只有确认到达曲目末尾，才视为自然结束。
             var handler = PlaybackEnded;
             if (handler != null) handler();
         }
