@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 
@@ -108,7 +108,15 @@ namespace Lumen.Lyrics
                 if (variant != null) return variant;
             }
 
-            // 2) 同名但扩展名可疑：读头部嗅探
+            // 2) 全名后多带一段（xxx.mpc.lrc、xxx.zh-hans.vtt 这类神经病命名）：
+            //    在文件名后追加任意一段再拼受支持的扩展名
+            foreach (var ext in SupportedExtensions)
+            {
+                var suffixed = FindSuffixed(dir, baseName, ext);
+                if (suffixed != null) return suffixed;
+            }
+
+            // 3) 同名但扩展名可疑：读头部嗅探
             foreach (var candidate in SafeEnumerateFiles(dir, baseName + ".*"))
             {
                 var ext = Path.GetExtension(candidate).ToLowerInvariant();
@@ -159,6 +167,42 @@ namespace Lumen.Lyrics
         {
             try { return Directory.EnumerateFiles(dir, pattern); }
             catch { return new string[0]; }
+        }
+
+        /// <summary>
+        /// 找「主名 + 中间一段 + 扩展名」的歌词，比如 song.mpc.lrc。
+        /// 中间段必须非空；多个候选时取名字最短的（中间段最少），再按名字排序保证稳定。
+        /// </summary>
+        private static string FindSuffixed(string dir, string baseName, string ext)
+        {
+            string best = null;
+            try
+            {
+                foreach (var file in Directory.EnumerateFiles(dir, baseName + "*"))
+                {
+                    var name = Path.GetFileName(file);
+                    if (name.Length <= baseName.Length + ext.Length) continue;
+                    if (!name.StartsWith(baseName, StringComparison.OrdinalIgnoreCase)) continue;
+                    if (!name.EndsWith(ext, StringComparison.OrdinalIgnoreCase)) continue;
+
+                    var middleLength = name.Length - baseName.Length - ext.Length;
+                    if (middleLength <= 0) continue;
+
+                    // 中间段必须用分隔符开头，避免把 songbook.lrc 误当成 song 的歌词
+                    var first = name[baseName.Length];
+                    if (char.IsLetterOrDigit(first)) continue;
+
+                    if (best == null ||
+                        name.Length < Path.GetFileName(best).Length ||
+                        (name.Length == Path.GetFileName(best).Length &&
+                         string.Compare(name, Path.GetFileName(best), StringComparison.OrdinalIgnoreCase) < 0))
+                    {
+                        best = file;
+                    }
+                }
+            }
+            catch { }
+            return best;
         }
 
         private static string FindCaseInsensitive(string dir, string fileName)
