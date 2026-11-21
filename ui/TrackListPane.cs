@@ -1,15 +1,19 @@
 using System;
 using System.Collections.Generic;
 using System.Collections.ObjectModel;
+using System.Collections.Specialized;
 using System.ComponentModel;
 using System.Globalization;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using System.Windows.Data;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Media3D;
 using System.Windows.Threading;
 using Lumen.Models;
+using Track = Lumen.Models.Track;
 
 namespace Lumen.UI
 {
@@ -20,12 +24,31 @@ namespace Lumen.UI
     ///   1. 用 ListBox + VirtualizingStackPanel，只为**可见行**创建可视化元素。
     ///      之前是往 StackPanel 里 add 600 个 Border，一次导入要建几千个控件。
     ///   2. 行模板用数据绑定，滚动时容器复用（Recycling）。
-    ///   3. 切歌只改 IsPlaying 标记，不重建列表。
+    ///   3. 批量替换采用单次 Reset 通知；切歌用 O(1) 缓存行切换高亮，不重建列表。
     /// </summary>
     public sealed class TrackListPane : Grid
     {
+        /// <summary>支持批量替换（单次 Reset 通知）的集合，避免大列表逐条 Add 卡顿。</summary>
+        private sealed class RangeObservableCollection<T> : ObservableCollection<T>
+        {
+            public void ReplaceAll(IEnumerable<T> items)
+            {
+                CheckReentrancy();
+                Items.Clear();
+                if (items != null)
+                {
+                    foreach (var item in items) Items.Add(item);
+                }
+                OnPropertyChanged(new PropertyChangedEventArgs("Count"));
+                OnPropertyChanged(new PropertyChangedEventArgs("Item[]"));
+                OnCollectionChanged(new NotifyCollectionChangedEventArgs(NotifyCollectionChangedAction.Reset));
+            }
+        }
+
         private readonly TextBox _search;
         private readonly Button _groupButton;
+        private readonly TextBlock _groupNameText;
+        private readonly TextBlock _groupCountText;
         private readonly Button _sortButton;
         private readonly Button _moreButton;
         private readonly Button _locateButton;
@@ -34,16 +57,21 @@ namespace Lumen.UI
         private readonly Border _statusBar;
         private readonly TextBlock _statusText;
 
-        private readonly ObservableCollection<RowItem> _rows = new ObservableCollection<RowItem>();
+        private readonly RangeObservableCollection<RowItem> _rows = new RangeObservableCollection<RowItem>();
+        private readonly Dictionary<string, RowItem> _rowByPath = new Dictionary<string, RowItem>(StringComparer.OrdinalIgnoreCase);
+        private readonly Dictionary<int, double> _numberWidthCache = new Dictionary<int, double>();
         private readonly DispatcherTimer _searchDebounce;
         private readonly DispatcherTimer _statusTimer;
 
         private List<Track> _tracks = new List<Track>();
         private List<Group> _groups = new List<Group>();
         private string _currentGroupId;
+        private string _currentSortMode = TrackSorter.Added;
         private int _playingIndex = -1;
         private Track _playingTrack;
+        private RowItem _activePlayingRow;
         private double _numberWidth = 32;
+        private double _cachedPixelsPerDip;
 
         public event Action<Track> TrackActivated;
         public event Action<Track> PlayRequested;
@@ -67,6 +95,7 @@ namespace Lumen.UI
             AllowDrop = true;
             Drop += OnDrop;
             DragOver += OnDragOver;
+            Unloaded += OnUnloaded;
 
             RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
             RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
@@ -80,10 +109,35 @@ namespace Lumen.UI
             top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
             top.ColumnDefinitions.Add(new ColumnDefinition { Width = GridLength.Auto });
 
+            // 复用分组按钮内部可视树，刷新时仅更新 TextBlock 文本
+            var groupPanel = new StackPanel { Orientation = Orientation.Horizontal };
+            _groupNameText = new TextBlock
+            {
+                Text = "分组",
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = Theme.Brush("Brush.Text"),
+                TextTrimming = TextTrimming.CharacterEllipsis,
+                MaxWidth = 150
+            };
+            _groupCountText = new TextBlock
+            {
+                Text = "0",
+                VerticalAlignment = VerticalAlignment.Center,
+                Foreground = Theme.Brush("Brush.TextFaint"),
+                FontSize = 11,
+                Margin = new Thickness(8, 0, 0, 0)
+            };
+            var chevron = Icons.Create(Icons.ChevronDown, 11, null, Theme.Brush("Brush.TextDim"), 1.5);
+            chevron.Margin = new Thickness(10, 0, 0, 0);
+            groupPanel.Children.Add(_groupNameText);
+            groupPanel.Children.Add(_groupCountText);
+            groupPanel.Children.Add(chevron);
+
             _groupButton = new Button
             {
                 Style = (Style)FindResourceSafe("Btn.Group"),
-                Height = 28
+                Height = 28,
+                Content = groupPanel
             };
             _groupButton.Click += delegate { ShowGroupMenu(); };
             Grid.SetColumn(_groupButton, 0);
@@ -102,6 +156,7 @@ namespace Lumen.UI
                 _searchDebounce.Stop();
                 _searchDebounce.Start();
             };
+            _search.PreviewKeyDown += OnSearchPreviewKeyDown;
             Grid.SetColumn(searchHost, 1);
             top.Children.Add(searchHost);
 
@@ -206,18 +261,41 @@ namespace Lumen.UI
             Children.Add(_statusBar);
 
             _searchDebounce = new DispatcherTimer { Interval = TimeSpan.FromMilliseconds(200) };
-            _searchDebounce.Tick += delegate
-            {
-                _searchDebounce.Stop();
-                ApplyFilter();
-            };
+            _searchDebounce.Tick += OnSearchDebounceTick;
 
             _statusTimer = new DispatcherTimer { Interval = TimeSpan.FromSeconds(3) };
-            _statusTimer.Tick += delegate
+            _statusTimer.Tick += OnStatusTimerTick;
+        }
+
+        private void OnSearchDebounceTick(object sender, EventArgs e)
+        {
+            _searchDebounce.Stop();
+            ApplyFilter();
+        }
+
+        private void OnStatusTimerTick(object sender, EventArgs e)
+        {
+            _statusTimer.Stop();
+            _statusBar.Visibility = Visibility.Collapsed;
+        }
+
+        private void OnUnloaded(object sender, RoutedEventArgs e)
+        {
+            _searchDebounce.Stop();
+            _statusTimer.Stop();
+        }
+
+        private void OnSearchPreviewKeyDown(object sender, KeyEventArgs e)
+        {
+            if (e.Key == Key.Escape)
             {
-                _statusTimer.Stop();
-                _statusBar.Visibility = Visibility.Collapsed;
-            };
+                if (!string.IsNullOrEmpty(_search.Text))
+                {
+                    ClearSearch();
+                }
+                _list.Focus();
+                e.Handled = true;
+            }
         }
 
         private object FindResourceSafe(string key)
@@ -244,7 +322,7 @@ namespace Lumen.UI
         {
             public Track Track;
             public int Number;
-            public double NumberWidth;
+            public double NumberWidth { get; set; }
 
             private bool _isPlaying;
 
@@ -454,45 +532,33 @@ namespace Lumen.UI
         {
             var group = FindCurrentGroup();
             var name = group != null ? group.Name : "分组";
-            var count = group != null ? group.Tracks.Count : 0;
+            var count = group != null && group.Tracks != null ? group.Tracks.Count : 0;
 
-            var panel = new StackPanel { Orientation = Orientation.Horizontal };
-            panel.Children.Add(new TextBlock
-            {
-                Text = name,
-                VerticalAlignment = VerticalAlignment.Center,
-                Foreground = Theme.Brush("Brush.Text"),
-                TextTrimming = TextTrimming.CharacterEllipsis,
-                MaxWidth = 150
-            });
-            panel.Children.Add(new TextBlock
-            {
-                Text = count.ToString(CultureInfo.InvariantCulture),
-                VerticalAlignment = VerticalAlignment.Center,
-                Foreground = Theme.Brush("Brush.TextFaint"),
-                FontSize = 11,
-                Margin = new Thickness(8, 0, 0, 0)
-            });
-
-            // 箭头和数字之间留出间距
-            var chevron = Icons.Create(Icons.ChevronDown, 11, null, Theme.Brush("Brush.TextDim"), 1.5);
-            chevron.Margin = new Thickness(10, 0, 0, 0);
-            panel.Children.Add(chevron);
-
-            _groupButton.Content = panel;
+            _groupNameText.Text = name;
+            _groupCountText.Text = count.ToString(CultureInfo.InvariantCulture);
             _groupButton.ToolTip = name + "（" + count + " 首）\n点击切换或管理分组";
         }
 
         private Group FindCurrentGroup()
         {
             if (_groups == null) return null;
-            return _groups.Find(g => g.Id == _currentGroupId) ?? (_groups.Count > 0 ? _groups[0] : null);
+            return _groups.Find(g => g != null && g.Id == _currentGroupId) ?? (_groups.Count > 0 ? _groups[0] : null);
+        }
+
+        private bool IsCurrentGroupShuffled()
+        {
+            var group = FindCurrentGroup();
+            return group != null && group.ShuffledOrder != null && group.ShuffledOrder.Count > 0;
         }
 
         public void SetTracks(List<Track> tracks, string sortMode)
         {
             _tracks = tracks ?? new List<Track>();
-            _sortButton.ToolTip = "排序：" + TrackSorter.DisplayName(sortMode);
+            _currentSortMode = string.IsNullOrEmpty(sortMode) ? TrackSorter.Added : sortMode;
+            _sortButton.ToolTip = IsCurrentGroupShuffled()
+                ? "排序：已打乱顺序"
+                : "排序：" + TrackSorter.DisplayName(_currentSortMode);
+            UpdateGroupButton();
             ApplyFilter();
         }
 
@@ -506,15 +572,9 @@ namespace Lumen.UI
         /// <summary>把列表滚动到当前播放的那一行并选中（「定位到当前播放」）。</summary>
         public void ScrollToPlaying()
         {
-            RowItem found = null;
-            foreach (var row in _rows)
-            {
-                if (row.IsPlaying)
-                {
-                    found = row;
-                    break;
-                }
-            }
+            RowItem found = (_activePlayingRow != null && _activePlayingRow.IsPlaying)
+                ? _activePlayingRow
+                : null;
 
             if (found == null)
             {
@@ -527,28 +587,63 @@ namespace Lumen.UI
             _list.ScrollIntoView(found);
         }
 
-        /// <summary>按曲目匹配播放标记，不按可见行下标（搜索过滤后下标会对不上）。</summary>
+        /// <summary>按曲目匹配播放标记，使用 O(1) 缓存与路径映射避免全表扫描。</summary>
         private void UpdatePlayingFlags()
         {
-            for (int i = 0; i < _rows.Count; i++)
+            if (_activePlayingRow != null)
             {
-                var track = _rows[i].Track;
-                _rows[i].IsPlaying = _playingTrack != null && track != null &&
-                    string.Equals(track.Path, _playingTrack.Path, StringComparison.OrdinalIgnoreCase);
+                _activePlayingRow.IsPlaying = false;
+                _activePlayingRow = null;
+            }
+
+            if (_playingTrack == null || string.IsNullOrEmpty(_playingTrack.Path)) return;
+
+            RowItem next;
+            if (_rowByPath.TryGetValue(_playingTrack.Path, out next))
+            {
+                next.IsPlaying = true;
+                _activePlayingRow = next;
             }
         }
 
-        public void RefreshRows()
+        /// <summary>刷新行显示；传入 changed 时仅增量刷新对应行，传 null 时全量刷新。</summary>
+        public void RefreshRows(IList<Track> changed = null)
         {
             UpdateGroupButton();
-            foreach (var row in _rows) row.RaiseAll();
+
+            if (changed == null)
+            {
+                foreach (var row in _rows) row.RaiseAll();
+                return;
+            }
+
+            if (changed.Count == 0) return;
+
+            for (int i = 0; i < changed.Count; i++)
+            {
+                var track = changed[i];
+                if (track == null || string.IsNullOrEmpty(track.Path)) continue;
+
+                RowItem row;
+                if (_rowByPath.TryGetValue(track.Path, out row))
+                {
+                    row.RaiseAll();
+                }
+            }
         }
 
         public void FlashStatus(string message)
         {
+            _statusTimer.Stop();
+            if (string.IsNullOrEmpty(message))
+            {
+                _statusText.Text = string.Empty;
+                _statusBar.Visibility = Visibility.Collapsed;
+                return;
+            }
+
             _statusText.Text = message;
             _statusBar.Visibility = Visibility.Visible;
-            _statusTimer.Stop();
             _statusTimer.Start();
         }
 
@@ -558,23 +653,35 @@ namespace Lumen.UI
 
         private void ApplyFilter()
         {
-            var keywords = ParseKeywords(_search.Text);
+            _searchDebounce.Stop();
 
-            _rows.Clear();
+            var keywords = ParseKeywords(_search.Text);
             int number = 0;
 
-            var pending = new List<RowItem>();
+            var pending = new List<RowItem>(_tracks.Count);
+            _rowByPath.Clear();
+            _activePlayingRow = null;
+
             foreach (var t in _tracks)
             {
-                if (!t.Matches(keywords)) continue;
+                if (t == null || !t.Matches(keywords)) continue;
                 number++;
-                pending.Add(new RowItem { Track = t, Number = number });
+                var row = new RowItem { Track = t, Number = number };
+                pending.Add(row);
+                if (!string.IsNullOrEmpty(t.Path) && !_rowByPath.ContainsKey(t.Path))
+                {
+                    _rowByPath[t.Path] = row;
+                }
             }
 
             // 序号列宽度按最大编号自适应（序号再大也不会省略号）
             _numberWidth = MeasureNumberColumn(number);
-            foreach (var row in pending) row.NumberWidth = _numberWidth;
-            foreach (var row in pending) _rows.Add(row);
+            for (int i = 0; i < pending.Count; i++)
+            {
+                pending[i].NumberWidth = _numberWidth;
+            }
+
+            _rows.ReplaceAll(pending);
 
             UpdateEmptyState(number);
             UpdatePlayingFlags();
@@ -609,18 +716,36 @@ namespace Lumen.UI
             return result;
         }
 
-        private static double MeasureNumberColumn(int count)
+        private double MeasureNumberColumn(int count)
         {
+            double pixelsPerDip = VisualTreeHelper.GetDpi(this).PixelsPerDip;
+            if (pixelsPerDip <= 0) pixelsPerDip = 1.0;
+
+            if (Math.Abs(_cachedPixelsPerDip - pixelsPerDip) > 0.001)
+            {
+                _numberWidthCache.Clear();
+                _cachedPixelsPerDip = pixelsPerDip;
+            }
+
+            int digits = count <= 0 ? 1 : count.ToString(CultureInfo.InvariantCulture).Length;
+            double cached;
+            if (_numberWidthCache.TryGetValue(digits, out cached))
+            {
+                return cached;
+            }
+
             var probe = new FormattedText(
-                count.ToString(CultureInfo.InvariantCulture),
+                new string('8', digits),
                 CultureInfo.CurrentCulture,
                 FlowDirection.LeftToRight,
                 new Typeface("Segoe UI"),
                 12,
                 Brushes.Black,
-                VisualTreeHelper.GetDpi(new DrawingVisual()).PixelsPerDip);
+                pixelsPerDip);
 
-            return Math.Max(26, probe.Width + 6);
+            double width = Math.Max(26, probe.Width + 6);
+            _numberWidthCache[digits] = width;
+            return width;
         }
 
         // ------------------------------------------------------------------
@@ -648,6 +773,17 @@ namespace Lumen.UI
             ShowTrackMenu(row.Track, _list);
         }
 
+        private static DependencyObject GetParentObject(DependencyObject obj)
+        {
+            if (obj == null) return null;
+            if (obj is Visual || obj is Visual3D)
+            {
+                var visualParent = VisualTreeHelper.GetParent(obj);
+                if (visualParent != null) return visualParent;
+            }
+            return LogicalTreeHelper.GetParent(obj);
+        }
+
         private RowItem ResolveRow(DependencyObject source)
         {
             while (source != null)
@@ -659,7 +795,7 @@ namespace Lumen.UI
                 if (presenter != null && presenter.DataContext is RowItem)
                     return presenter.DataContext as RowItem;
 
-                source = VisualTreeHelper.GetParent(source);
+                source = GetParentObject(source);
             }
             return null;
         }
@@ -740,6 +876,7 @@ namespace Lumen.UI
             menu.Items.Add(reveal);
 
             menu.PlacementTarget = target;
+            menu.Placement = PlacementMode.MousePoint;
             menu.IsOpen = true;
         }
 
@@ -818,6 +955,7 @@ namespace Lumen.UI
         private void ShowSortMenu()
         {
             var menu = new ContextMenu();
+            bool isShuffled = IsCurrentGroupShuffled();
             var modes = new[]
             {
                 TrackSorter.Added, TrackSorter.Title, TrackSorter.TitleDesc,
@@ -827,7 +965,11 @@ namespace Lumen.UI
 
             foreach (var mode in modes)
             {
-                var item = new MenuItem { Header = TrackSorter.DisplayName(mode) };
+                var item = new MenuItem
+                {
+                    Header = TrackSorter.DisplayName(mode),
+                    IsChecked = !isShuffled && string.Equals(_currentSortMode, mode, StringComparison.Ordinal)
+                };
                 var captured = mode;
                 item.Click += delegate
                 {
@@ -836,6 +978,16 @@ namespace Lumen.UI
                 };
                 menu.Items.Add(item);
             }
+
+            menu.Items.Add(new Separator());
+
+            var shuffledItem = new MenuItem
+            {
+                Header = "打乱顺序",
+                IsChecked = isShuffled
+            };
+            shuffledItem.Click += delegate { Raise(ShuffleRequested); };
+            menu.Items.Add(shuffledItem);
 
             menu.PlacementTarget = _sortButton;
             menu.IsOpen = true;
@@ -887,7 +1039,14 @@ namespace Lumen.UI
 
         public void ClearSearch()
         {
+            if (string.IsNullOrEmpty(_search.Text))
+            {
+                _searchDebounce.Stop();
+                return;
+            }
             _search.Text = string.Empty;
+            _searchDebounce.Stop();
+            ApplyFilter();
         }
     }
 }

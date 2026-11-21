@@ -1,5 +1,6 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
+using System.Text;
 using Lumen.Lyrics;
 
 namespace Lumen.SelfTest
@@ -16,16 +17,17 @@ namespace Lumen.SelfTest
         }
 
         public static void Run(List<string> results, Action<bool, string> report)
-        {            // ---- LRC 标准格式 ----
-            var lrc = "[ti:测试]\n[ar:歌手]\n[00:12.50]第一句\n[01:05.25]第二句\n[01:05.25][02:10.00]重复句";
+        {
+            // ---- LRC 标准格式 ----
+            var lrc = "[ti:测试]\n[ar:歌手]\n[00:12.50]第一句\n[01:05.25]第二句\n[01:30.00][02:10.00]重复句";
             var doc = LyricsParser.Parse(lrc, "t.lrc", 200);
             report(doc.IsSynced, "LRC 识别为同步歌词");
             report(doc.Lines.Count == 4, "LRC 一行多时间标签展开 (期望 4 行, 实际 " + doc.Lines.Count + ")");
-            report(Math.Abs(doc.Lines[0].Time - 12.5) < 0.001, "LRC [mm:ss.xx] 时间解析 = 12.5");
-            report(Math.Abs(doc.Lines[1].Time - 65.25) < 0.001, "LRC 第二句时间 = 65.25");
-            report(doc.Lines[3].Time > 129.9 && doc.Lines[3].Time < 130.1, "LRC 重复行第二时间 = 130");
-            report(doc.Lines[0].Text == "第一句", "LRC 文本提取正确");
-            report(Math.Abs(doc.Lines[0].EndTime - 65.25) < 0.001, "LRC EndTime 自动补齐");
+            report(doc.Lines.Count > 0 && Math.Abs(doc.Lines[0].Time - 12.5) < 0.001, "LRC [mm:ss.xx] 时间解析 = 12.5");
+            report(doc.Lines.Count > 1 && Math.Abs(doc.Lines[1].Time - 65.25) < 0.001, "LRC 第二句时间 = 65.25");
+            report(doc.Lines.Count > 3 && doc.Lines[3].Time > 129.9 && doc.Lines[3].Time < 130.1, "LRC 重复行第二时间 = 130");
+            report(doc.Lines.Count > 0 && doc.Lines[0].Text == "第一句", "LRC 文本提取正确");
+            report(doc.Lines.Count > 0 && Math.Abs(doc.Lines[0].EndTime - 65.25) < 0.001, "LRC EndTime 自动补齐");
 
             // ---- LRC 增强型逐字标签压平 ----
             var lrc2 = "[00:01.00]<00:01.00>你<00:01.50>好<00:02.00>世界";
@@ -33,18 +35,39 @@ namespace Lumen.SelfTest
             report(doc2.Lines.Count == 1 && doc2.Lines[0].Text == "你好世界",
                 "增强型 <mm:ss.xx> 逐字标签压平 (得到 '" + (doc2.Lines.Count > 0 ? doc2.Lines[0].Text : "") + "')");
 
-            // ---- LRC offset ----
+            // ---- LRC offset（含后置 offset 与负时间截断回归） ----
             var lrc3 = "[offset:500]\n[00:10.00]偏移测试";
             var doc3 = LyricsParser.Parse(lrc3, "t.lrc", 100);
             report(doc3.Lines.Count == 1 && Math.Abs(doc3.Lines[0].Time - 9.5) < 0.001,
                 "LRC [offset:500] 使歌词提前 0.5s");
 
-            // ---- WebVTT ----
-            var vtt = "WEBVTT\n\nNOTE 这是注释\n\n00:00:05.000 --> 00:00:07.500\n<v 歌手>你好</v>\n世界\n\n00:00:08.000 --> 00:00:09.000\n第二句\n";
+            var lrcTrailingOffset = "[00:00.20]第一句\n[00:10.00]第二句\n[offset:500]";
+            var docTrailing = LyricsParser.Parse(lrcTrailingOffset, "t.lrc", 100);
+            report(docTrailing.Lines.Count == 2 &&
+                   Math.Abs(docTrailing.Lines[0].Time - 0.0) < 0.001 &&
+                   Math.Abs(docTrailing.Lines[1].Time - 9.5) < 0.001,
+                "LRC 后置 [offset:500] 对全文生效且负时间截断为 0");
+
+            // ---- LRC 双语同时间戳合并回归 ----
+            var lrcBilingual = "[00:10.00]Hello World\n[00:10.00]你好世界\n[00:20.00]Next";
+            var docBi = LyricsParser.Parse(lrcBilingual, "bi.lrc", 60);
+            report(docBi.Lines.Count == 2 && docBi.Lines[0].Text == "Hello World\n你好世界",
+                "LRC 双语同时间戳按换行合并 (得到 '" + (docBi.Lines.Count > 0 ? docBi.Lines[0].Text.Replace("\n", "\\n") : "") + "')");
+
+            // ---- LRC 间奏空行截断回归 ----
+            var lrcInterlude = "[00:10.00]第一句\n[00:15.00]\n[00:25.00]第二句";
+            var docInt = LyricsParser.Parse(lrcInterlude, "interlude.lrc", 60);
+            report(docInt.Lines.Count == 2 &&
+                   Math.Abs(docInt.Lines[0].EndTime - 15.0) < 0.001 &&
+                   Math.Abs(docInt.Lines[1].Time - 25.0) < 0.001,
+                "LRC 间奏空行截断前一句 EndTime 且不显示空行");
+
+            // ---- WebVTT（含 <合唱> 保留回归） ----
+            var vtt = "WEBVTT\n\nNOTE 这是注释\n\n00:00:05.000 --> 00:00:07.500\n<v 歌手>你好</v>\n<合唱>世界\n\n00:00:08.000 --> 00:00:09.000\n第二句\n";
             var docV = LyricsParser.Parse(vtt, "t.vtt", 100);
             report(docV.IsSynced && docV.Lines.Count == 2, "VTT 解析出 2 条 cue (实际 " + docV.Lines.Count + ")");
-            report(docV.Lines.Count > 0 && docV.Lines[0].Text == "你好 世界",
-                "VTT <v> 说话人标签去掉 + 多行合并 (得到 '" + (docV.Lines.Count > 0 ? docV.Lines[0].Text : "") + "')");
+            report(docV.Lines.Count > 0 && docV.Lines[0].Text == "你好 <合唱>世界",
+                "VTT <v> 标签去掉且保留 <合唱> (得到 '" + (docV.Lines.Count > 0 ? docV.Lines[0].Text : "") + "')");
             report(docV.Lines.Count > 0 && Math.Abs(docV.Lines[0].Time - 5.0) < 0.001, "VTT cue 起始时间 = 5s");
             report(docV.FormatName == "WebVTT", "VTT 格式名正确");
 
@@ -55,22 +78,27 @@ namespace Lumen.SelfTest
             report(docS.Lines.Count > 0 && docS.Lines[0].Text == "第一行 第二行", "SRT 多行合并");
             report(docS.Lines.Count > 0 && Math.Abs(docS.Lines[0].Time - 3.0) < 0.001, "SRT 逗号毫秒时间解析");
 
-            // ---- ASS ----
-            var ass = "[Script Info]\nTitle: x\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n" +
+            // ---- ASS（含 [V4+ Styles] 节不抢占回归 + SSA 格式名） ----
+            var ass = "[Script Info]\nTitle: x\n\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour\n" +
+                      "Style: Default,Arial,20,&H00FFFFFF\n\n[Events]\n" +
+                      "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n" +
                       "Dialogue: 0,0:00:02.50,0:00:05.00,Default,,0,0,0,,{\\pos(190,280)}带样式的歌词\n" +
                       "Dialogue: 0,0:00:06.00,0:00:08.00,Default,,0,0,0,,第二句\\N换行";
             var docA = LyricsParser.Parse(ass, "t.ass", 100);
-            report(docA.Lines.Count == 2, "ASS 解析出 2 条 (实际 " + docA.Lines.Count + ")");
+            report(docA.Lines.Count == 2, "ASS 含 [V4+ Styles] 正常解析出 2 条 (实际 " + docA.Lines.Count + ")");
             report(docA.Lines.Count > 0 && docA.Lines[0].Text == "带样式的歌词",
                 "ASS {\\pos} 样式覆盖已去掉 (得到 '" + (docA.Lines.Count > 0 ? docA.Lines[0].Text : "") + "')");
             report(docA.Lines.Count > 0 && Math.Abs(docA.Lines[0].Time - 2.5) < 0.001, "ASS H:MM:SS.cc 时间解析");
             report(docA.Lines.Count > 1 && docA.Lines[1].Text == "第二句 换行", "ASS \\N 换行转换");
+            var docSsa = LyricsParser.Parse(ass, "t.ssa", 100);
+            report(docSsa.FormatName == "SSA" && docSsa.Lines.Count == 2, "SSA 扩展名识别为 SSA");
 
             // ---- 纯文本 ----
             var plain = "第一行\n\n第二行\n第三行\n";
             var docP = LyricsParser.Parse(plain, "t.txt", 100);
             report(!docP.IsSynced && docP.Lines.Count == 3, "纯文本识别为不同步 (实际 " + docP.Lines.Count + " 行)");
             report(docP.FormatName == "纯文本", "纯文本格式名正确");
+            report(docP.IndexAt(10) == -1 && docP.TotalSeconds == 0, "非同步文档 IndexAt 返回 -1 且 TotalSeconds 为 0");
 
             // ---- 内容嗅探：扩展名不对 ----
             var sniffLrc = "[00:01.00]被误命名的歌词";
@@ -85,11 +113,15 @@ namespace Lumen.SelfTest
             report(findDoc.IndexAt(25) == 1, "IndexAt: 句中返回前一句");
             report(findDoc.IndexAt(999) == 2, "IndexAt: 超出末句返回最后一句");
 
-            // ---- 编码 ----
-            var utf8 = new System.Text.UTF8Encoding(true).GetBytes("[00:01.00]带BOM的UTF8");
+            // ---- 编码（含无 BOM UTF-16 BE 回归） ----
+            var utf8 = new UTF8Encoding(true).GetBytes("[00:01.00]带BOM的UTF8");
             report(TextEncoding.Decode(utf8).StartsWith("[00:01.00]"), "UTF-8 BOM 解码");
-            var utf16 = System.Text.Encoding.Unicode.GetBytes("[00:01.00]UTF16");
-            report(TextEncoding.Decode(utf16).StartsWith("[00:01.00]"), "UTF-16 LE 解码");
+            var utf16Le = Encoding.Unicode.GetBytes("[00:01.00]UTF16LE");
+            report(TextEncoding.Decode(utf16Le).StartsWith("[00:01.00]"), "无 BOM UTF-16 LE 解码");
+            var utf16Be = Encoding.BigEndianUnicode.GetBytes("[00:01.00]UTF16BE测试");
+            var utf16BeDecoded = TextEncoding.Decode(utf16Be);
+            report(utf16BeDecoded == "[00:01.00]UTF16BE测试",
+                "无 BOM UTF-16 BE 解码 (得到 '" + utf16BeDecoded + "')");
 
             // GBK：.NET Core 不带 936 代码页，需要注册 CodePagesEncodingProvider
             var gbkBytes = GbkTestBytes("[00:01.00]中文GBK测试");

@@ -36,7 +36,7 @@
     -->
     <RestorePackagesPath>$(MSBuildProjectDirectory)\packages</RestorePackagesPath>
 
-    <NoWarn>$(NoWarn);CA1416;CS0649;MSB3277</NoWarn>
+    <NoWarn>$(NoWarn);CA1416</NoWarn>
   </PropertyGroup>
 
   <!-- 工具/临时工程不能编译进主项目 -->

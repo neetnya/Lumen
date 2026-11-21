@@ -4,6 +4,7 @@ using System.IO;
 using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
+using System.Threading;
 using Lumen.Models;
 
 namespace Lumen
@@ -49,6 +50,7 @@ namespace Lumen
         public Group EnsureGroup()
         {
             if (Groups == null) Groups = new List<Group>();
+            Groups.RemoveAll(g => g == null);
             if (Groups.Count == 0)
             {
                 Groups.Add(new Group { Name = "默认分组" });
@@ -66,7 +68,7 @@ namespace Lumen
             get
             {
                 if (Groups == null) return null;
-                var g = Groups.Find(x => x.Id == CurrentGroupId);
+                var g = Groups.Find(x => x != null && x.Id == CurrentGroupId);
                 return g ?? (Groups.Count > 0 ? Groups[0] : null);
             }
         }
@@ -74,13 +76,13 @@ namespace Lumen
         public Group FindGroup(string id)
         {
             if (Groups == null || string.IsNullOrEmpty(id)) return null;
-            return Groups.Find(g => g.Id == id);
+            return Groups.Find(g => g != null && g.Id == id);
         }
 
         public Group FindGroupByName(string name)
         {
             if (Groups == null || string.IsNullOrEmpty(name)) return null;
-            return Groups.Find(g => string.Equals(g.Name, name, StringComparison.OrdinalIgnoreCase));
+            return Groups.Find(g => g != null && string.Equals(g.Name, name, StringComparison.OrdinalIgnoreCase));
         }
 
         // ------------------------------------------------------------------
@@ -99,79 +101,287 @@ namespace Lumen
 
         public static Config Load()
         {
-            lock (Gate)
-            {
-                try
-                {
-                    var path = Paths.ConfigFile;
-                    if (!File.Exists(path)) return new Config();
-
-                    var text = File.ReadAllText(path, Encoding.UTF8);
-                    if (string.IsNullOrWhiteSpace(text)) return new Config();
-
-                    var config = JsonSerializer.Deserialize<Config>(text, JsonOptions);
-                    if (config == null) return new Config();
-
-                    if (config.Groups == null) config.Groups = new List<Group>();
-                    foreach (var g in config.Groups)
-                    {
-                        if (g.Tracks == null) g.Tracks = new List<Track>();
-                        if (string.IsNullOrEmpty(g.Id)) g.Id = Guid.NewGuid().ToString("N");
-                    }
-                    config.EnsureGroup();
-                    return config;
-                }
-                catch (Exception ex)
-                {
-                    Log.Error("读取配置失败，使用默认配置", ex);
-                    return new Config();
-                }
-            }
+            return Load(Paths.ConfigFile);
         }
 
-        /// <summary>保存。写临时文件再替换，避免中途崩溃损坏配置。</summary>
-        public bool Save()
+        /// <summary>从指定路径加载配置（供自测隔离使用）。</summary>
+        public static Config Load(string customPath)
         {
             lock (Gate)
             {
+                if (string.IsNullOrWhiteSpace(customPath))
+                {
+                    var fallback = new Config();
+                    fallback.EnsureGroup();
+                    return fallback;
+                }
+
+                var backupPath = customPath + ".bak";
+
+                if (!File.Exists(customPath))
+                {
+                    if (File.Exists(backupPath))
+                    {
+                        if (TryDeserializeFile(backupPath, out var recovered, out var backupEx))
+                        {
+                            Log.Warn("主配置文件缺失，已从备份恢复: " + backupPath);
+                            Normalize(recovered);
+                            return recovered;
+                        }
+                        if (backupEx != null) Log.Error("读取备份配置失败: " + backupPath, backupEx);
+                    }
+
+                    var fresh = new Config();
+                    fresh.EnsureGroup();
+                    return fresh;
+                }
+
+                if (TryDeserializeFile(customPath, out var config, out var loadEx))
+                {
+                    Normalize(config);
+                    return config;
+                }
+
+                Log.Error("读取配置失败，准备保留损坏现场并尝试从备份恢复: " + customPath, loadEx);
+                PreserveCorruptFile(customPath);
+
+                if (File.Exists(backupPath))
+                {
+                    if (TryDeserializeFile(backupPath, out var recovered, out var backupEx))
+                    {
+                        Log.Warn("已从备份恢复配置: " + backupPath);
+                        Normalize(recovered);
+                        return recovered;
+                    }
+                    Log.Error("从备份恢复配置也失败: " + backupPath, backupEx);
+                }
+
+                var defaultConfig = new Config();
+                defaultConfig.EnsureGroup();
+                return defaultConfig;
+            }
+        }
+
+        private static bool TryDeserializeFile(string path, out Config config, out Exception error)
+        {
+            config = null;
+            error = null;
+            try
+            {
+                var text = File.ReadAllText(path, Encoding.UTF8);
+                if (string.IsNullOrWhiteSpace(text))
+                {
+                    error = new InvalidDataException("配置文件内容为空");
+                    return false;
+                }
+
+                var parsed = JsonSerializer.Deserialize<Config>(text, JsonOptions);
+                if (parsed == null)
+                {
+                    error = new InvalidDataException("配置文件反序列化结果为 null");
+                    return false;
+                }
+
+                config = parsed;
+                return true;
+            }
+            catch (Exception ex)
+            {
+                error = ex;
+                return false;
+            }
+        }
+
+        private static void PreserveCorruptFile(string path)
+        {
+            try
+            {
+                if (!File.Exists(path)) return;
+                var stamp = DateTime.Now.ToString("yyyyMMddHHmmss");
+                var corruptPath = path + ".corrupt." + stamp;
+                if (File.Exists(corruptPath))
+                {
+                    corruptPath = path + ".corrupt." + stamp + "." + Guid.NewGuid().ToString("N").Substring(0, 6);
+                }
+                File.Move(path, corruptPath);
+                Log.Warn("已保留损坏配置文件: " + corruptPath);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("重命名损坏配置文件失败: " + ex.Message);
+            }
+        }
+
+        private static void Normalize(Config config)
+        {
+            config.VolumePercent = Math.Clamp(config.VolumePercent, 0, 100);
+            config.PlayMode = (config.PlayMode >= 0 && config.PlayMode <= 2) ? config.PlayMode : 0;
+
+            config.WindowWidth = double.IsFinite(config.WindowWidth)
+                ? Math.Clamp(config.WindowWidth, 400, 7680)
+                : 1180;
+            config.WindowHeight = double.IsFinite(config.WindowHeight)
+                ? Math.Clamp(config.WindowHeight, 300, 4320)
+                : 720;
+
+            if (!double.IsFinite(config.WindowLeft)) config.WindowLeft = double.NaN;
+            if (!double.IsFinite(config.WindowTop)) config.WindowTop = double.NaN;
+            if (!double.IsFinite(config.DesktopLyricsLeft)) config.DesktopLyricsLeft = double.NaN;
+            if (!double.IsFinite(config.DesktopLyricsTop)) config.DesktopLyricsTop = double.NaN;
+
+            config.DesktopLyricsFontScale = double.IsFinite(config.DesktopLyricsFontScale)
+                ? Math.Clamp(config.DesktopLyricsFontScale, 0.5, 3.0)
+                : 1.0;
+            config.DesktopLyricsHeight = double.IsFinite(config.DesktopLyricsHeight)
+                ? Math.Clamp(config.DesktopLyricsHeight, 48, 400)
+                : 92;
+
+            if (config.Groups == null) config.Groups = new List<Group>();
+            config.Groups.RemoveAll(g => g == null);
+            foreach (var g in config.Groups)
+            {
+                if (g.Tracks == null) g.Tracks = new List<Track>();
+                g.Tracks.RemoveAll(t => t == null);
+                if (string.IsNullOrEmpty(g.Id)) g.Id = Guid.NewGuid().ToString("N");
+            }
+
+            config.EnsureGroup();
+        }
+
+        /// <summary>保存。写唯一临时文件并刷盘，再原子替换并保留 .bak 备份。</summary>
+        public bool Save()
+        {
+            return SaveInternal(Paths.ConfigFile);
+        }
+
+        /// <summary>保存到指定路径（供自测隔离使用）。</summary>
+        public void Save(string customPath)
+        {
+            SaveInternal(customPath);
+        }
+
+        private bool SaveInternal(string path)
+        {
+            if (string.IsNullOrWhiteSpace(path)) return false;
+
+            try
+            {
+                var json = JsonSerializer.Serialize(this, JsonOptions);
+                WriteJsonAtomic(path, json);
+                return true;
+            }
+            catch (Exception ex)
+            {
+                Log.Error("保存配置失败", ex);
+                return false;
+            }
+        }
+
+        private static void WriteJsonAtomic(string path, string json)
+        {
+            lock (Gate)
+            {
+                var dir = Path.GetDirectoryName(path);
+                if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+
+                var temp = path + "." + Guid.NewGuid().ToString("N") + ".tmp";
+                var backup = path + ".bak";
+
                 try
                 {
-                    var path = Paths.ConfigFile;
-                    var dir = Path.GetDirectoryName(path);
-                    if (!string.IsNullOrEmpty(dir) && !Directory.Exists(dir)) Directory.CreateDirectory(dir);
+                    var bytes = new UTF8Encoding(false).GetBytes(json);
+                    using (var fs = new FileStream(temp, FileMode.CreateNew, FileAccess.Write, FileShare.None))
+                    {
+                        fs.Write(bytes, 0, bytes.Length);
+                        fs.Flush(flushToDisk: true);
+                    }
 
-                    var json = JsonSerializer.Serialize(this, JsonOptions);
-
-                    var temp = path + ".tmp";
-                    File.WriteAllText(temp, json, new UTF8Encoding(false));
-
-                    if (File.Exists(path)) File.Replace(temp, path, null);
-                    else File.Move(temp, path);
-                    return true;
+                    if (File.Exists(path))
+                    {
+                        File.Replace(temp, path, backup, ignoreMetadataErrors: true);
+                    }
+                    else
+                    {
+                        File.Move(temp, path);
+                    }
                 }
-                catch (Exception ex)
+                finally
                 {
-                    Log.Error("保存配置失败", ex);
-                    return false;
+                    if (File.Exists(temp))
+                    {
+                        try { File.Delete(temp); } catch { }
+                    }
                 }
             }
         }
 
-        private int _saveQueued;
+        private readonly object _asyncSaveGate = new object();
+        private string _pendingJson;
+        private string _pendingPath;
+        private bool _dirty;
+        private bool _saving;
 
         /// <summary>
-        /// 后台保存：播放进度每几秒就会变，不能每次都同步写盘。
-        /// 同一时刻只允许一个保存排队，后到的请求合并进去。
+        /// 后台保存：先在调用线程完成 JSON 序列化快照，再投递纯 I/O 落盘。
+        /// 写盘期间到达的新修改会标记 _dirty 并触发下一轮落盘，不丢更新。
         /// </summary>
         public void SaveAsync()
         {
-            if (System.Threading.Interlocked.CompareExchange(ref _saveQueued, 1, 0) != 0) return;
-
-            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            string json;
+            string path;
+            try
             {
-                try { Save(); }
-                catch (Exception ex) { Log.Warn("后台保存配置失败: " + ex.Message); }
-                finally { System.Threading.Interlocked.Exchange(ref _saveQueued, 0); }
+                path = Paths.ConfigFile;
+                json = JsonSerializer.Serialize(this, JsonOptions);
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("后台保存配置序列化失败: " + ex.Message);
+                return;
+            }
+
+            bool startWorker = false;
+            lock (_asyncSaveGate)
+            {
+                _pendingJson = json;
+                _pendingPath = path;
+                _dirty = true;
+                if (!_saving)
+                {
+                    _saving = true;
+                    startWorker = true;
+                }
+            }
+
+            if (!startWorker) return;
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                while (true)
+                {
+                    string snapshot;
+                    string targetPath;
+                    lock (_asyncSaveGate)
+                    {
+                        if (!_dirty)
+                        {
+                            _saving = false;
+                            return;
+                        }
+                        snapshot = _pendingJson;
+                        targetPath = _pendingPath;
+                        _dirty = false;
+                    }
+
+                    try
+                    {
+                        WriteJsonAtomic(targetPath, snapshot);
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warn("后台保存配置失败: " + ex.Message);
+                    }
+                }
             });
         }
     }

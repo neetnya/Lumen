@@ -1,4 +1,4 @@
-﻿<Window x:Class="Lumen.UI.WindowChromeBase"
+<Window x:Class="Lumen.UI.WindowChromeBase"
         xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
         WindowStyle="None"
@@ -28,7 +28,9 @@
                 <RowDefinition Height="Auto" />
                 <RowDefinition Height="*" />
             </Grid.RowDefinitions>
-            <ContentPresenter x:Name="TitleBarArea" Grid.Row="0" />
+            <ContentPresenter x:Name="TitleBarArea"
+                              Grid.Row="0"
+                              Height="{Binding TitleBarHeight, RelativeSource={RelativeSource AncestorType=Window}}" />
             <ContentPresenter x:Name="BodyArea" Grid.Row="1" />
         </Grid>
     </Border>

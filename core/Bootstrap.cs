@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Windows;
@@ -8,10 +8,15 @@ namespace Lumen
 {
     /// <summary>
     /// 启动装配：
-    /// 命令行解析 → 单实例 → 启动提示卡片 → 建主窗口 → 打开文件 → 异常兜底。
+    /// 命令行解析 → 数据目录覆盖 → 单实例 → 启动提示卡片 → 建主窗口 → 打开文件 → 异常兜底。
     /// </summary>
     public static class Bootstrap
     {
+        private static bool _inDispatcherException;
+        private static readonly Queue<DateTime> _recentDispatcherExceptions = new Queue<DateTime>();
+        private const int ExceptionBurstThreshold = 3;
+        private const double ExceptionBurstWindowSeconds = 5.0;
+
         public static void Run(Application app, string[] args)
         {
             // 全局异常兜底：不让播放器无声崩掉
@@ -20,6 +25,12 @@ namespace Lumen
             System.Threading.Tasks.TaskScheduler.UnobservedTaskException += OnTaskException;
 
             var options = CommandLine.Parse(args ?? new string[0]);
+
+            // 必须在首次访问 Log / Paths.DataDir 之前应用命令行数据目录覆盖
+            if (!string.IsNullOrWhiteSpace(options.DataDirOverride))
+            {
+                Paths.OverrideDataDir(options.DataDirOverride);
+            }
 
             Log.Info("=== Lumen 启动 === " + string.Join(" ", args ?? new string[0]));
             Log.Info("数据目录: " + Paths.DataDir);
@@ -45,6 +56,7 @@ namespace Lumen
             {
                 if (options.Files.Count > 0) single.SendFilesToExisting(options.Files);
                 else single.SendActivate();
+                single.Dispose();
                 app.Shutdown(0);
                 return;
             }
@@ -64,7 +76,7 @@ namespace Lumen
             if (options.SmokeSeconds > 0)
             {
                 Log.Info("冒烟模式：将在 " + options.SmokeSeconds + " 秒后自动退出");
-                var smokeTimer = new System.Windows.Threading.DispatcherTimer
+                var smokeTimer = new DispatcherTimer
                 {
                     Interval = TimeSpan.FromSeconds(options.SmokeSeconds)
                 };
@@ -85,13 +97,43 @@ namespace Lumen
         private static void OnDispatcherException(object sender, DispatcherUnhandledExceptionEventArgs e)
         {
             Log.Error("界面线程未处理异常", e.Exception);
+
+            var now = DateTime.UtcNow;
+            while (_recentDispatcherExceptions.Count > 0 &&
+                   (now - _recentDispatcherExceptions.Peek()).TotalSeconds > ExceptionBurstWindowSeconds)
+            {
+                _recentDispatcherExceptions.Dequeue();
+            }
+            _recentDispatcherExceptions.Enqueue(now);
+
+            if (_recentDispatcherExceptions.Count > ExceptionBurstThreshold)
+            {
+                Log.Error("5 秒内未处理界面异常超过 3 次，触发熔断并退出");
+                e.Handled = false;
+                try
+                {
+                    if (Application.Current != null) Application.Current.Shutdown(1);
+                }
+                catch { }
+                return;
+            }
+
             e.Handled = true;
+            if (_inDispatcherException) return;
+
+            _inDispatcherException = true;
             try
             {
-                UI.Dialogs.ShowError(Application.Current != null ? Application.Current.MainWindow : null,
-                    "出错了", e.Exception.Message);
+                UI.Dialogs.ShowError(
+                    Application.Current != null ? Application.Current.MainWindow : null,
+                    "出错了",
+                    e.Exception != null ? e.Exception.Message : "发生未知错误");
             }
             catch { }
+            finally
+            {
+                _inDispatcherException = false;
+            }
         }
 
         private static void OnDomainException(object sender, UnhandledExceptionEventArgs e)

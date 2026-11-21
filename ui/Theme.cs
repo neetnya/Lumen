@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Windows;
 using System.Windows.Media;
 
@@ -24,6 +24,7 @@ namespace Lumen.UI
 
         private static object Lookup(string key)
         {
+            if (string.IsNullOrEmpty(key)) return null;
             try
             {
                 var app = Application.Current;

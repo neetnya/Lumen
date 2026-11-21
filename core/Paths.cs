@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 
 namespace Lumen
@@ -9,6 +9,7 @@ namespace Lumen
     /// </summary>
     public static class Paths
     {
+        private static readonly object Gate = new object();
         private static string _dataDir;
 
         public static string ExeDir
@@ -29,43 +30,41 @@ namespace Lumen
         {
             get
             {
-                if (_dataDir != null) return _dataDir;
-
-                var forced = Environment.GetEnvironmentVariable("LUMEN_DATA_DIR");
-                if (!string.IsNullOrWhiteSpace(forced))
+                lock (Gate)
                 {
-                    try
+                    if (_dataDir != null) return _dataDir;
+
+                    var forced = Environment.GetEnvironmentVariable("LUMEN_DATA_DIR");
+                    if (!string.IsNullOrWhiteSpace(forced) && TryPrepare(forced))
                     {
-                        Directory.CreateDirectory(forced);
                         _dataDir = forced;
                         return _dataDir;
                     }
-                    catch { }
-                }
 
-                // 1) 程序旁边（便携）
-                var portable = Path.Combine(ExeDir, "data");
-                if (TryPrepare(portable))
-                {
-                    _dataDir = portable;
+                    // 1) 程序旁边（便携）
+                    var portable = Path.Combine(ExeDir, "data");
+                    if (TryPrepare(portable))
+                    {
+                        _dataDir = portable;
+                        return _dataDir;
+                    }
+
+                    // 2) 源码运行时的仓库目录
+                    var cwd = Directory.GetCurrentDirectory();
+                    var local = Path.Combine(cwd, "data");
+                    if (!string.Equals(cwd, ExeDir, StringComparison.OrdinalIgnoreCase) && TryPrepare(local))
+                    {
+                        _dataDir = local;
+                        return _dataDir;
+                    }
+
+                    // 3) 回退 %APPDATA%\Lumen
+                    var roaming = Path.Combine(
+                        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Lumen");
+                    TryPrepare(roaming);
+                    _dataDir = roaming;
                     return _dataDir;
                 }
-
-                // 2) 源码运行时的仓库目录
-                var cwd = Directory.GetCurrentDirectory();
-                var local = Path.Combine(cwd, "data");
-                if (!string.Equals(cwd, ExeDir, StringComparison.OrdinalIgnoreCase) && TryPrepare(local))
-                {
-                    _dataDir = local;
-                    return _dataDir;
-                }
-
-                // 3) 回退 %APPDATA%\Lumen
-                var roaming = Path.Combine(
-                    Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "Lumen");
-                TryPrepare(roaming);
-                _dataDir = roaming;
-                return _dataDir;
             }
         }
 
@@ -73,10 +72,14 @@ namespace Lumen
 
         public static string SelftestResultFile { get { return Path.Combine(DataDir, "selftest-result.json"); } }
 
-        /// <summary>用于测试：覆盖数据目录。</summary>
+        /// <summary>用于测试或命令行覆盖数据目录。</summary>
         public static void OverrideDataDir(string dir)
         {
-            _dataDir = dir;
+            lock (Gate)
+            {
+                _dataDir = dir;
+            }
+            Log.ResetPath();
         }
 
         private static bool TryPrepare(string dir)
@@ -84,7 +87,9 @@ namespace Lumen
             try
             {
                 if (!Directory.Exists(dir)) Directory.CreateDirectory(dir);
-                var probe = Path.Combine(dir, ".writable");
+                var probe = Path.Combine(
+                    dir,
+                    ".writable." + Environment.ProcessId + "." + Guid.NewGuid().ToString("N"));
                 File.WriteAllText(probe, "1");
                 File.Delete(probe);
                 return true;

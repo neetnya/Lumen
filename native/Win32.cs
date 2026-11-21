@@ -1,4 +1,5 @@
 using System;
+using System.IO;
 using System.Runtime.InteropServices;
 
 namespace Lumen.Native
@@ -14,11 +15,44 @@ namespace Lumen.Native
         public const int WM_HOTKEY = 0x0312;
         public const int WM_LBUTTONUP = 0x0202;
 
-        [DllImport("user32.dll", SetLastError = true)]
-        public static extern int GetWindowLong(IntPtr hWnd, int nIndex);
+        public const int SM_CXSCREEN = 0;
+        public const int SM_CYSCREEN = 1;
 
-        [DllImport("user32.dll", SetLastError = true)]
-        public static extern int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong);
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongW", SetLastError = true)]
+        private static extern int GetWindowLong32(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW", SetLastError = true)]
+        private static extern IntPtr GetWindowLongPtr64(IntPtr hWnd, int nIndex);
+
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongW", SetLastError = true)]
+        private static extern int SetWindowLong32(IntPtr hWnd, int nIndex, int dwNewLong);
+
+        [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW", SetLastError = true)]
+        private static extern IntPtr SetWindowLongPtr64(IntPtr hWnd, int nIndex, IntPtr dwNewLong);
+
+        public static IntPtr GetWindowLongPtr(IntPtr hWnd, int nIndex)
+        {
+            return IntPtr.Size == 8
+                ? GetWindowLongPtr64(hWnd, nIndex)
+                : new IntPtr(GetWindowLong32(hWnd, nIndex));
+        }
+
+        public static IntPtr SetWindowLongPtr(IntPtr hWnd, int nIndex, IntPtr dwNewLong)
+        {
+            return IntPtr.Size == 8
+                ? SetWindowLongPtr64(hWnd, nIndex, dwNewLong)
+                : new IntPtr(SetWindowLong32(hWnd, nIndex, dwNewLong.ToInt32()));
+        }
+
+        public static int GetWindowLong(IntPtr hWnd, int nIndex)
+        {
+            return unchecked((int)GetWindowLongPtr(hWnd, nIndex).ToInt64());
+        }
+
+        public static int SetWindowLong(IntPtr hWnd, int nIndex, int dwNewLong)
+        {
+            return unchecked((int)SetWindowLongPtr(hWnd, nIndex, new IntPtr(dwNewLong)).ToInt64());
+        }
 
         [DllImport("user32.dll")]
         public static extern bool SetWindowPos(IntPtr hWnd, IntPtr hWndInsertAfter, int X, int Y, int cx, int cy, uint uFlags);
@@ -44,6 +78,12 @@ namespace Lumen.Native
         [DllImport("user32.dll")]
         public static extern IntPtr GetForegroundWindow();
 
+        [DllImport("user32.dll")]
+        public static extern int GetSystemMetrics(int nIndex);
+
+        [DllImport("user32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
+        public static extern uint RegisterWindowMessage(string lpString);
+
         [DllImport("shcore.dll")]
         public static extern int GetDpiForMonitor(IntPtr hmonitor, int dpiType, out uint dpiX, out uint dpiY);
 
@@ -57,13 +97,13 @@ namespace Lumen.Native
         [DllImport("user32.dll")]
         public static extern bool DestroyWindow(IntPtr hWnd);
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern IntPtr DefWindowProc(IntPtr hWnd, int msg, IntPtr wParam, IntPtr lParam);
 
-        [DllImport("user32.dll")]
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
         public static extern ushort RegisterClass(ref WNDCLASS lpWndClass);
 
-        [DllImport("user32.dll")]
+        [DllImport("kernel32.dll", CharSet = CharSet.Unicode, SetLastError = true)]
         public static extern IntPtr GetModuleHandle(string lpModuleName);
 
         [StructLayout(LayoutKind.Sequential)]
@@ -103,9 +143,11 @@ namespace Lumen.Native
 
         public static readonly IntPtr HWND_TOPMOST = new IntPtr(-1);
         public static readonly IntPtr HWND_NOTOPMOST = new IntPtr(-2);
-        public const uint SWP_NOMOVE = 0x0002;
         public const uint SWP_NOSIZE = 0x0001;
+        public const uint SWP_NOMOVE = 0x0002;
+        public const uint SWP_NOZORDER = 0x0004;
         public const uint SWP_NOACTIVATE = 0x0010;
+        public const uint SWP_FRAMECHANGED = 0x0020;
         public const uint SWP_SHOWWINDOW = 0x0040;
 
         public const uint MOD_ALT = 0x0001;
@@ -122,24 +164,28 @@ namespace Lumen.Native
         public static void SetClickThrough(IntPtr hwnd, bool enabled)
         {
             if (hwnd == IntPtr.Zero) return;
-            var ex = GetWindowLong(hwnd, GWL_EXSTYLE);
-            if (enabled) ex |= WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE;
-            else ex &= ~(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
-            SetWindowLong(hwnd, GWL_EXSTYLE, ex);
+            long ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE).ToInt64();
+            if (enabled) ex |= (long)(WS_EX_TRANSPARENT | WS_EX_LAYERED | WS_EX_NOACTIVATE);
+            else ex &= ~(long)(WS_EX_TRANSPARENT | WS_EX_NOACTIVATE);
+            SetWindowLongPtr(hwnd, GWL_EXSTYLE, new IntPtr(ex));
+            SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
 
         public static void SetTopMost(IntPtr hwnd)
         {
             if (hwnd == IntPtr.Zero) return;
             SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 0, 0,
-                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_SHOWWINDOW);
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE);
         }
 
         public static void SetToolWindow(IntPtr hwnd)
         {
             if (hwnd == IntPtr.Zero) return;
-            var ex = GetWindowLong(hwnd, GWL_EXSTYLE);
-            SetWindowLong(hwnd, GWL_EXSTYLE, ex | WS_EX_TOOLWINDOW);
+            long ex = GetWindowLongPtr(hwnd, GWL_EXSTYLE).ToInt64();
+            SetWindowLongPtr(hwnd, GWL_EXSTYLE, new IntPtr(ex | WS_EX_TOOLWINDOW));
+            SetWindowPos(hwnd, IntPtr.Zero, 0, 0, 0, 0,
+                SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
         }
 
         public static RECT GetWorkArea(IntPtr hwnd)
@@ -163,12 +209,14 @@ namespace Lumen.Native
             var work = new RECT();
             if (SystemParametersInfo(SPI_GETWORKAREA, 0, ref work, 0)) return work;
 
+            int w = GetSystemMetrics(SM_CXSCREEN);
+            int h = GetSystemMetrics(SM_CYSCREEN);
             return new RECT
             {
                 left = 0,
                 top = 0,
-                right = (int)System.Windows.SystemParameters.PrimaryScreenWidth,
-                bottom = (int)System.Windows.SystemParameters.PrimaryScreenHeight
+                right = w > 0 ? w : 1920,
+                bottom = h > 0 ? h : 1080
             };
         }
 
@@ -186,7 +234,16 @@ namespace Lumen.Native
             var info = new MONITORINFO();
             info.cbSize = Marshal.SizeOf<MONITORINFO>();
             if (monitor != IntPtr.Zero && GetMonitorInfo(monitor, ref info)) return info.rcMonitor;
-            return new RECT { left = 0, top = 0, right = 1920, bottom = 1080 };
+
+            int w = GetSystemMetrics(SM_CXSCREEN);
+            int h = GetSystemMetrics(SM_CYSCREEN);
+            return new RECT
+            {
+                left = 0,
+                top = 0,
+                right = w > 0 ? w : 1920,
+                bottom = h > 0 ? h : 1080
+            };
         }
 
         // ------------------------------------------------------------------
@@ -207,10 +264,11 @@ namespace Lumen.Native
         }
 
         private const uint FO_DELETE = 0x0003;
-        private const ushort FOF_ALLOWUNDO = 0x0040;   // 送进回收站
+        private const ushort FOF_ALLOWUNDO = 0x0040;      // 送进回收站
         private const ushort FOF_NOCONFIRMATION = 0x0010; // 不弹确认
         private const ushort FOF_SILENT = 0x0004;
         private const ushort FOF_NOCONFIRMMKDIR = 0x0200;
+        private const ushort FOF_NOERRORUI = 0x0400;      // 禁止弹出错误对话框
 
         [DllImport("shell32.dll", CharSet = CharSet.Unicode)]
         private static extern int SHFileOperation(ref SHFILEOPSTRUCT lpFileOp);
@@ -218,12 +276,15 @@ namespace Lumen.Native
         /// <summary>把文件送进回收站（不弹确认框，可恢复）。返回 0 表示成功。</summary>
         public static int DeleteToRecycleBin(string path)
         {
+            if (string.IsNullOrWhiteSpace(path)) return -1;
+            var fullPath = Path.GetFullPath(path);
+
             // SHFileOperation 要求 pFrom 以两个 null 结尾
             var op = new SHFILEOPSTRUCT
             {
                 wFunc = FO_DELETE,
-                pFrom = path + "\0\0",
-                fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOCONFIRMMKDIR
+                pFrom = fullPath + "\0\0",
+                fFlags = FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOCONFIRMMKDIR | FOF_NOERRORUI
             };
             return SHFileOperation(ref op);
         }

@@ -4,7 +4,6 @@ using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Shapes;
-using System.Windows.Threading;
 
 namespace Lumen.UI
 {
@@ -27,8 +26,9 @@ namespace Lumen.UI
         private readonly TextBlock _time;
         private readonly TextBlock _volumePercent;
 
-        private bool _isPlaying;
+        private bool? _isPlaying;
         private int _mode;
+        private string _currentTrackPath;
 
         public event Action PlayPauseClicked;
         public event Action PrevClicked;
@@ -59,6 +59,13 @@ namespace Lumen.UI
             {
                 var handler = SeekRequested;
                 if (handler != null && _progress.Duration > 0) handler(ratio * _progress.Duration);
+            };
+            _progress.PreviewSeek += delegate (double ratio)
+            {
+                if (_progress.Duration > 0)
+                {
+                    _time.Text = FormatTime(ratio * _progress.Duration, true) + " / " + FormatTime(_progress.Duration, true);
+                }
             };
             Grid.SetColumn(_progress, 0);
             progressRow.Children.Add(_progress);
@@ -159,17 +166,18 @@ namespace Lumen.UI
             Grid.SetColumn(center, 1);
             row.Children.Add(center);
 
-            // 右：喇叭 + 音量 + 百分比（整组固定在最右侧）
+            // 右：喇叭 + 音量 + 百分比（整组固定在最右侧，滚轮绑在整组容器上）
             var right = new StackPanel
             {
                 Orientation = Orientation.Horizontal,
                 HorizontalAlignment = HorizontalAlignment.Right,
-                VerticalAlignment = VerticalAlignment.Center
+                VerticalAlignment = VerticalAlignment.Center,
+                Background = Brushes.Transparent
             };
+            right.MouseWheel += OnVolumeWheel;
 
             _btnMute = GhostButton(Icons.VolumeHigh, "静音");
             _btnMute.Click += delegate { Raise(MuteToggled); };
-            _btnMute.MouseWheel += OnVolumeWheel;
             right.Children.Add(_btnMute);
 
             // 音量滑块紧挨喇叭图标，右侧标注当前百分比
@@ -184,7 +192,6 @@ namespace Lumen.UI
             {
                 UpdateVolumePercent(v);
             };
-            _volume.MouseWheel += OnVolumeWheel;
             right.Children.Add(_volume);
 
             _volumePercent = new TextBlock
@@ -235,6 +242,7 @@ namespace Lumen.UI
 
         public void SetPlaying(bool playing)
         {
+            if (_isPlaying == playing) return;
             _isPlaying = playing;
             _btnPlay.Content = Icons.Create(playing ? Icons.Pause : Icons.Play, 15, Brushes.White);
         }
@@ -258,12 +266,14 @@ namespace Lumen.UI
 
         public void SetVolume(float volume, bool muted)
         {
-            _volume.SetValueSilent(Math.Max(0f, Math.Min(1f, volume)));
+            float clamped = Math.Max(0f, Math.Min(1f, volume));
+            _volume.SetValueSilent(clamped);
             _btnMute.Content = Icons.Create(
                 muted ? Icons.VolumeMute : Icons.VolumeHigh, 14,
                 null, Theme.Brush(muted ? "Brush.Danger" : "Brush.TextDim"), 1.4);
             _btnMute.ToolTip = muted ? "取消静音" : "静音";
-            UpdateVolumePercent(Math.Max(0f, Math.Min(1f, volume)));
+            if (!_volume.IsDragging)
+                UpdateVolumePercent(clamped);
         }
 
         private void UpdateVolumePercent(float volume)
@@ -271,7 +281,7 @@ namespace Lumen.UI
             _volumePercent.Text = Math.Round(volume * 100).ToString("0") + "%";
         }
 
-        /// <summary>鼠标滚轮在喇叭/音量条上滚动：按步进增减音量。</summary>
+        /// <summary>鼠标滚轮在右侧音量区域滚动：按步进增减音量。</summary>
         private void OnVolumeWheel(object sender, MouseWheelEventArgs e)
         {
             var handler = VolumeDelta;
@@ -286,15 +296,27 @@ namespace Lumen.UI
         public void SetTimeline(double position, double duration, bool hasTrack)
         {
             _progress.SetState(position, duration, hasTrack);
-            _time.Text = FormatTime(position) + " / " + FormatTime(duration);
+            if (!_progress.IsDragging)
+            {
+                _time.Text = FormatTime(position, hasTrack) + " / " + FormatTime(duration, hasTrack && duration > 0);
+            }
         }
 
         public void SetTrack(Lumen.Models.Track track)
         {
+            string nextPath = track != null ? track.Path : null;
+            if (!string.Equals(_currentTrackPath, nextPath, StringComparison.OrdinalIgnoreCase))
+            {
+                _currentTrackPath = nextPath;
+                _progress.CancelDrag();
+            }
+
             if (track == null)
             {
                 _title.Text = "未播放";
+                _title.ToolTip = null;
                 _subtitle.Text = "";
+                _subtitle.ToolTip = null;
                 return;
             }
 
@@ -305,12 +327,13 @@ namespace Lumen.UI
             if (!string.IsNullOrEmpty(track.Artist)) parts.Add(track.Artist);
             if (!string.IsNullOrEmpty(track.Album)) parts.Add(track.Album);
             _subtitle.Text = string.Join(" · ", parts);
-            _subtitle.ToolTip = _subtitle.Text;
+            _subtitle.ToolTip = string.IsNullOrEmpty(_subtitle.Text) ? null : _subtitle.Text;
         }
 
-        private static string FormatTime(double seconds)
+        private static string FormatTime(double seconds, bool allowZero = false)
         {
-            if (seconds <= 0 || double.IsNaN(seconds) || double.IsInfinity(seconds)) return "--:--";
+            if (double.IsNaN(seconds) || double.IsInfinity(seconds)) return "--:--";
+            if (seconds < 0 || (!allowZero && seconds <= 0)) return "--:--";
             var t = TimeSpan.FromSeconds(seconds);
             return t.TotalHours >= 1
                 ? string.Format("{0}:{1:00}:{2:00}", (int)t.TotalHours, t.Minutes, t.Seconds)
@@ -329,25 +352,32 @@ namespace Lumen.UI
         private readonly Border _track;
         private readonly Border _fill;
         private readonly Ellipse _knob;
+        private readonly Brush _trackActiveBrush;
+        private readonly Brush _trackInactiveBrush;
         private double _duration;
         private double _position;
         private bool _dragging;
         private bool _hasTrack;
 
         public event Action<double> Seek;
+        public event Action<double> PreviewSeek;
 
         public double Duration { get { return _duration; } }
+        public bool IsDragging { get { return _dragging; } }
 
         public ProgressBarEx()
         {
             Background = Brushes.Transparent;
             Cursor = Cursors.Hand;
 
+            _trackActiveBrush = Theme.Brush("Brush.Raised");
+            _trackInactiveBrush = Theme.Brush("Brush.PanelAlt");
+
             _track = new Border
             {
                 Height = 3,
                 CornerRadius = new CornerRadius(2),
-                Background = Theme.Brush("Brush.Raised"),
+                Background = _trackInactiveBrush,
                 VerticalAlignment = VerticalAlignment.Center,
                 Margin = new Thickness(16, 0, 16, 0)
             };
@@ -381,6 +411,7 @@ namespace Lumen.UI
             MouseLeftButtonDown += OnDown;
             MouseMove += OnMove;
             MouseLeftButtonUp += OnUp;
+            LostMouseCapture += OnLostMouseCapture;
             MouseEnter += delegate { if (_hasTrack) _knob.Visibility = Visibility.Visible; };
             MouseLeave += delegate { if (!_dragging) _knob.Visibility = Visibility.Collapsed; };
         }
@@ -390,7 +421,21 @@ namespace Lumen.UI
             _hasTrack = hasTrack;
             _position = position;
             _duration = duration;
+            if (!hasTrack)
+            {
+                if (_dragging) CancelDrag();
+                _knob.Visibility = Visibility.Collapsed;
+            }
             if (!_dragging) UpdateVisual();
+        }
+
+        public void CancelDrag()
+        {
+            if (!_dragging) return;
+            _dragging = false;
+            if (IsMouseCaptured) ReleaseMouseCapture();
+            if (!IsMouseOver || !_hasTrack) _knob.Visibility = Visibility.Collapsed;
+            UpdateVisual();
         }
 
         private void UpdateVisual()
@@ -400,7 +445,8 @@ namespace Lumen.UI
 
             _fill.Width = usable * ratio;
             _knob.Margin = new Thickness(16 + usable * ratio - 5, 0, 0, 0);
-            _track.Background = _hasTrack ? Theme.Brush("Brush.Raised") : Theme.Brush("Brush.PanelAlt");
+            _track.Background = _hasTrack ? _trackActiveBrush : _trackInactiveBrush;
+            if (!_hasTrack) _knob.Visibility = Visibility.Collapsed;
         }
 
         private void OnDown(object sender, MouseButtonEventArgs e)
@@ -421,8 +467,17 @@ namespace Lumen.UI
         {
             if (!_dragging) return;
             _dragging = false;
-            ReleaseMouseCapture();
+            if (IsMouseCaptured) ReleaseMouseCapture();
             Apply(e.GetPosition(this).X, true);
+            if (!IsMouseOver || !_hasTrack) _knob.Visibility = Visibility.Collapsed;
+        }
+
+        private void OnLostMouseCapture(object sender, MouseEventArgs e)
+        {
+            if (!_dragging) return;
+            _dragging = false;
+            if (!IsMouseOver || !_hasTrack) _knob.Visibility = Visibility.Collapsed;
+            UpdateVisual();
         }
 
         private void Apply(double x, bool commit)
@@ -432,6 +487,9 @@ namespace Lumen.UI
 
             _fill.Width = usable * ratio;
             _knob.Margin = new Thickness(16 + usable * ratio - 5, 0, 0, 0);
+
+            var preview = PreviewSeek;
+            if (preview != null) preview(ratio);
 
             if (commit)
             {
@@ -455,6 +513,8 @@ namespace Lumen.UI
 
         /// <summary>拖动过程中每次移动都会触发（用于实时显示，不等松手提交）。</summary>
         public event Action<float> PreviewValueChanged;
+
+        public bool IsDragging { get { return _dragging; } }
 
         public SliderEx()
         {
@@ -495,10 +555,12 @@ namespace Lumen.UI
             MouseLeftButtonDown += OnDown;
             MouseMove += OnMove;
             MouseLeftButtonUp += OnUp;
+            LostMouseCapture += delegate { _dragging = false; };
         }
 
         public void SetValueSilent(float value)
         {
+            if (_dragging) return;
             _silent = true;
             _value = Math.Max(0f, Math.Min(1f, value));
             UpdateVisual();
@@ -528,7 +590,7 @@ namespace Lumen.UI
         {
             if (!_dragging) return;
             _dragging = false;
-            ReleaseMouseCapture();
+            if (IsMouseCaptured) ReleaseMouseCapture();
             Apply(e.GetPosition(this).X, true);
         }
 

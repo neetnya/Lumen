@@ -11,7 +11,7 @@ namespace Lumen.UI
     /// <summary>
     /// 无边框窗口基类：自绘标题栏（不会出现两个标题栏），
     /// 靠 WindowChrome 保留系统八向缩放 / 贴边 / 最大化行为。
-    /// 子类把标题栏内容赋给 TitleBar，窗口内容赋给 Content。
+    /// 子类把标题栏内容赋给 TitleBar，窗口内容赋给 Body。
     /// </summary>
     public partial class WindowChromeBase : Window
     {
@@ -36,8 +36,10 @@ namespace Lumen.UI
             set { SetValue(TitleBarProperty, value); }
         }
 
+        private readonly Border _frameBorder;
         private readonly ContentPresenter _titleBarArea;
         private readonly ContentPresenter _bodyArea;
+        private HwndSource _hwndSource;
 
         /// <summary>
         /// 窗口主体内容。
@@ -60,6 +62,7 @@ namespace Lumen.UI
         {
             InitializeComponent();
 
+            _frameBorder = (Border)FindName("FrameBorder");
             _titleBarArea = (ContentPresenter)FindName("TitleBarArea");
             _bodyArea = (ContentPresenter)FindName("BodyArea");
 
@@ -77,7 +80,19 @@ namespace Lumen.UI
             CommandBindings.Add(new CommandBinding(SystemCommands.RestoreWindowCommand,
                 delegate { WindowState = WindowState.Normal; }));
 
-            StateChanged += delegate { OnWindowStateChanged(); };
+            StateChanged += delegate
+            {
+                UpdateFrameBorder();
+                OnWindowStateChanged();
+            };
+        }
+
+        private void UpdateFrameBorder()
+        {
+            if (_frameBorder == null) return;
+            _frameBorder.BorderThickness = WindowState == WindowState.Maximized
+                ? new Thickness(0)
+                : new Thickness(1);
         }
 
         /// <summary>子类可覆写：状态变化（用于切换最大化/还原图标）。</summary>
@@ -100,11 +115,27 @@ namespace Lumen.UI
                 double ratio = mouse.X / Math.Max(1, ActualWidth);
                 var screenPoint = PointToScreen(mouse);
 
+                double restoreWidth = RestoreBounds.Width;
                 WindowState = WindowState.Normal;
 
-                var scale = DpiScale();
-                Left = screenPoint.X / scale - ActualWidth * ratio;
-                Top = screenPoint.Y / scale - 22;
+                double targetWidth = (!double.IsNaN(restoreWidth) && !double.IsInfinity(restoreWidth) && restoreWidth > 0)
+                    ? restoreWidth
+                    : ActualWidth;
+
+                Point dipPoint;
+                var source = PresentationSource.FromVisual(this);
+                if (source != null && source.CompositionTarget != null)
+                {
+                    dipPoint = source.CompositionTarget.TransformFromDevice.Transform(screenPoint);
+                }
+                else
+                {
+                    double scale = DpiScale();
+                    dipPoint = new Point(screenPoint.X / scale, screenPoint.Y / scale);
+                }
+
+                Left = dipPoint.X - targetWidth * ratio;
+                Top = dipPoint.Y - Math.Min(Math.Max(mouse.Y, 8), TitleBarHeight);
             }
 
             try { DragMove(); }
@@ -128,8 +159,26 @@ namespace Lumen.UI
         protected override void OnSourceInitialized(EventArgs e)
         {
             base.OnSourceInitialized(e);
+            UpdateFrameBorder();
             var helper = new WindowInteropHelper(this);
-            if (helper.Handle != IntPtr.Zero) MaximizeFix.Apply(helper.Handle);
+            if (helper.Handle != IntPtr.Zero)
+            {
+                _hwndSource = HwndSource.FromHwnd(helper.Handle);
+                if (_hwndSource != null)
+                {
+                    _hwndSource.AddHook(MaximizeFix.Hook);
+                }
+            }
+        }
+
+        protected override void OnClosed(EventArgs e)
+        {
+            if (_hwndSource != null)
+            {
+                try { _hwndSource.RemoveHook(MaximizeFix.Hook); } catch { }
+                _hwndSource = null;
+            }
+            base.OnClosed(e);
         }
     }
 
@@ -149,7 +198,7 @@ namespace Lumen.UI
             catch { }
         }
 
-        private static IntPtr Hook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
+        internal static IntPtr Hook(IntPtr hwnd, int msg, IntPtr wParam, IntPtr lParam, ref bool handled)
         {
             if (msg != WM_GETMINMAXINFO) return IntPtr.Zero;
 

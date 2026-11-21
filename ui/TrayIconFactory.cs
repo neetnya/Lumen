@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Drawing;
 using System.Drawing.Drawing2D;
 using System.Drawing.Imaging;
@@ -19,19 +19,7 @@ namespace Lumen.UI
         {
             using (var bitmap = Render(size))
             {
-                var handle = bitmap.GetHicon();
-                try
-                {
-                    // 克隆一份托管 Icon，然后立刻释放原生句柄
-                    using (var temp = System.Drawing.Icon.FromHandle(handle))
-                    {
-                        return (System.Drawing.Icon)temp.Clone();
-                    }
-                }
-                finally
-                {
-                    DestroyIcon(handle);
-                }
+                return BitmapToIcon(bitmap);
             }
         }
 
@@ -42,7 +30,7 @@ namespace Lumen.UI
             {
                 if (!playing)
                 {
-                    // 暂停态：右下角加一个浅色方点
+                    // 暂停态：右下角加一个浅色圆点
                     using (var g = Graphics.FromImage(bitmap))
                     {
                         g.SmoothingMode = SmoothingMode.AntiAlias;
@@ -56,18 +44,24 @@ namespace Lumen.UI
                     }
                 }
 
-                var handle = bitmap.GetHicon();
-                try
+                return BitmapToIcon(bitmap);
+            }
+        }
+
+        private static System.Drawing.Icon BitmapToIcon(Bitmap bitmap)
+        {
+            var handle = bitmap.GetHicon();
+            try
+            {
+                // 克隆一份托管 Icon，然后立刻释放原生句柄
+                using (var temp = System.Drawing.Icon.FromHandle(handle))
                 {
-                    using (var temp = System.Drawing.Icon.FromHandle(handle))
-                    {
-                        return (System.Drawing.Icon)temp.Clone();
-                    }
+                    return (System.Drawing.Icon)temp.Clone();
                 }
-                finally
-                {
-                    DestroyIcon(handle);
-                }
+            }
+            finally
+            {
+                DestroyIcon(handle);
             }
         }
 

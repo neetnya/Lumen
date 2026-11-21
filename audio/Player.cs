@@ -1,6 +1,8 @@
-﻿using System;
+using System;
 using System.IO;
+using NAudio.CoreAudioApi;
 using NAudio.Wave;
+using NAudio.Wave.SampleProviders;
 
 namespace Lumen.Audio
 {
@@ -8,7 +10,7 @@ namespace Lumen.Audio
     /// 基于 NAudio 的播放核心。
     /// 解码：MediaFoundationReader（MP3 / AAC / M4A / WMA / MP4 容器）
     ///       + AudioFileReader（WAV / AIFF / 以及 MF 不可用时的回退）
-    /// 输出：WASAPI 共享模式（WasapiOut），失败时回退 WaveOut。
+    /// 输出：WASAPI 共享模式（WasapiOut），构造或初始化失败时回退 WaveOutEvent。
     /// 播放模式：顺序播放（到底停止）/ 列表循环 / 单曲循环。
     /// </summary>
     public sealed class Player : IDisposable
@@ -20,23 +22,50 @@ namespace Lumen.Audio
             RepeatOne = 2     // 单曲循环
         }
 
+        private sealed class EofTrackingSampleProvider : ISampleProvider
+        {
+            private readonly ISampleProvider _source;
+            private volatile bool _reachedEof;
+
+            public EofTrackingSampleProvider(ISampleProvider source)
+            {
+                _source = source;
+            }
+
+            public WaveFormat WaveFormat { get { return _source.WaveFormat; } }
+
+            public bool ReachedEof { get { return _reachedEof; } }
+
+            public void Reset()
+            {
+                _reachedEof = false;
+            }
+
+            public int Read(float[] buffer, int offset, int count)
+            {
+                int read = _source.Read(buffer, offset, count);
+                if (read == 0)
+                {
+                    _reachedEof = true;
+                }
+                return read;
+            }
+        }
+
         private readonly object _gate = new object();
 
         private IWavePlayer _output;
         private WaveStream _reader;
-
-        /// <summary>
-        /// 音量/格式转换层。
-        ///
-        /// 不能用 VolumeWaveProvider16 —— 它只接受 16bit PCM，而
-        /// AudioFileReader / MediaFoundationReader 输出的是 32bit 浮点，
-        /// 会抛 "Expecting PCM input"。WaveChannel32 能接受任意输入格式，
-        /// 并统一转成 32bit 浮点交给输出设备。
-        /// </summary>
-        private WaveChannel32 _volumeProvider;
+        private VolumeSampleProvider _volumeProvider;
+        private EofTrackingSampleProvider _eofTracker;
+        private EventHandler<StoppedEventArgs> _stoppedHandler;
 
         private string _currentPath;
+        private double _lastPositionSeconds;
+        private double _lastDurationSeconds;
+        private bool _outputFaulted;
 
+        private long _sessionId;
         private volatile bool _stoppingIntentionally;
         private volatile bool _disposed;
         private float _volume = 0.8f;
@@ -55,18 +84,48 @@ namespace Lumen.Audio
         // 状态
         // ------------------------------------------------------------------
 
-        public string CurrentPath { get { return _currentPath; } }
+        public string CurrentPath
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return _currentPath;
+                }
+            }
+        }
 
-        public bool HasTrack { get { return _reader != null && _currentPath != null; } }
+        public bool HasTrack
+        {
+            get
+            {
+                lock (_gate)
+                {
+                    return !string.IsNullOrEmpty(_currentPath) && (_reader != null || _outputFaulted);
+                }
+            }
+        }
 
         public bool IsPlaying
         {
-            get { return _output != null && _output.PlaybackState == PlaybackState.Playing; }
+            get
+            {
+                lock (_gate)
+                {
+                    return _output != null && _output.PlaybackState == PlaybackState.Playing;
+                }
+            }
         }
 
         public bool IsPaused
         {
-            get { return _output != null && _output.PlaybackState == PlaybackState.Paused; }
+            get
+            {
+                lock (_gate)
+                {
+                    return _output != null && _output.PlaybackState == PlaybackState.Paused;
+                }
+            }
         }
 
         /// <summary>当前播放位置（秒）。</summary>
@@ -74,10 +133,23 @@ namespace Lumen.Audio
         {
             get
             {
-                var r = _reader;
-                if (r == null) return 0;
-                try { return r.CurrentTime.TotalSeconds; }
-                catch { return 0; }
+                lock (_gate)
+                {
+                    if (_reader != null)
+                    {
+                        try
+                        {
+                            double pos = _reader.CurrentTime.TotalSeconds;
+                            if (double.IsFinite(pos) && pos >= 0)
+                            {
+                                _lastPositionSeconds = pos;
+                                return pos;
+                            }
+                        }
+                        catch { }
+                    }
+                    return _outputFaulted ? _lastPositionSeconds : 0;
+                }
             }
         }
 
@@ -86,42 +158,86 @@ namespace Lumen.Audio
         {
             get
             {
-                var r = _reader;
-                if (r == null) return 0;
-                try
+                lock (_gate)
                 {
-                    var total = r.TotalTime.TotalSeconds;
-                    return total > 0 && !double.IsNaN(total) && !double.IsInfinity(total) ? total : 0;
+                    if (_reader != null)
+                    {
+                        try
+                        {
+                            double total = _reader.TotalTime.TotalSeconds;
+                            if (total > 0 && double.IsFinite(total))
+                            {
+                                _lastDurationSeconds = total;
+                                return total;
+                            }
+                        }
+                        catch { }
+                    }
+                    return _outputFaulted ? _lastDurationSeconds : 0;
                 }
-                catch { return 0; }
             }
         }
 
         public PlayMode Mode
         {
-            get { return _mode; }
-            set { _mode = value; }
+            get
+            {
+                lock (_gate)
+                {
+                    return _mode;
+                }
+            }
+            set
+            {
+                lock (_gate)
+                {
+                    _mode = value;
+                }
+            }
         }
 
         public float Volume
         {
-            get { return _volume; }
+            get
+            {
+                lock (_gate)
+                {
+                    return _volume;
+                }
+            }
             set
             {
-                _volume = Math.Max(0f, Math.Min(1f, value));
-                var vp = _volumeProvider;
-                if (vp != null) vp.Volume = _muted ? 0f : _volume;
+                lock (_gate)
+                {
+                    float clamped = float.IsFinite(value) ? Math.Clamp(value, 0f, 1f) : _volume;
+                    _volume = clamped;
+                    if (_volumeProvider != null)
+                    {
+                        _volumeProvider.Volume = _muted ? 0f : _volume;
+                    }
+                }
             }
         }
 
         public bool Muted
         {
-            get { return _muted; }
+            get
+            {
+                lock (_gate)
+                {
+                    return _muted;
+                }
+            }
             set
             {
-                _muted = value;
-                var vp = _volumeProvider;
-                if (vp != null) vp.Volume = _muted ? 0f : _volume;
+                lock (_gate)
+                {
+                    _muted = value;
+                    if (_volumeProvider != null)
+                    {
+                        _volumeProvider.Volume = _muted ? 0f : _volume;
+                    }
+                }
             }
         }
 
@@ -130,9 +246,25 @@ namespace Lumen.Audio
         {
             try
             {
+                using (var enumerator = new MMDeviceEnumerator())
+                using (var device = enumerator.GetDefaultAudioEndpoint(DataFlow.Render, Role.Multimedia))
+                {
+                    if (device != null && device.State == DeviceState.Active)
+                    {
+                        return true;
+                    }
+                }
+            }
+            catch { }
+
+            try
+            {
                 return WaveOut.DeviceCount > 0;
             }
-            catch { return false; }
+            catch
+            {
+                return false;
+            }
         }
 
         // ------------------------------------------------------------------
@@ -145,53 +277,76 @@ namespace Lumen.Audio
         /// </summary>
         public bool Play(string path, double startSeconds)
         {
+            string failedMessage = null;
+            bool startedOk = false;
+
             lock (_gate)
             {
                 if (_disposed) return false;
                 if (string.IsNullOrEmpty(path) || !File.Exists(path))
                 {
-                    RaiseFailed("文件不存在: " + path);
-                    return false;
+                    failedMessage = "文件不存在: " + path;
                 }
-
-                try
+                else
                 {
-                    CloseInternal();
-
-                    _stoppingIntentionally = false;
-                    _reader = OpenReader(path);
-                    if (_reader == null)
+                    try
                     {
-                        RaiseFailed("无法解码: " + Path.GetFileName(path));
-                        return false;
-                    }
+                        CloseInternal();
 
-                    if (startSeconds > 0.05)
+                        long session = ++_sessionId;
+                        _stoppingIntentionally = false;
+                        _outputFaulted = false;
+                        _lastPositionSeconds = 0;
+                        _lastDurationSeconds = 0;
+
+                        _reader = OpenReader(path);
+                        if (_reader == null)
+                        {
+                            failedMessage = "无法解码: " + Path.GetFileName(path);
+                        }
+                        else
+                        {
+                            ApplyStartPosition(_reader, startSeconds);
+                            IWaveProvider pipeline = BuildPipeline(_reader);
+                            var output = CreateAndInitOutput(pipeline);
+
+                            EventHandler<StoppedEventArgs> stoppedHandler = (s, e) => OnPlaybackStopped(session, s, e);
+                            output.PlaybackStopped += stoppedHandler;
+
+                            _output = output;
+                            _stoppedHandler = stoppedHandler;
+                            _currentPath = path;
+                            UpdateCachedTimesUnsafe();
+
+                            _output.Play();
+                            startedOk = true;
+                        }
+                    }
+                    catch (Exception ex)
                     {
-                        var target = TimeSpan.FromSeconds(startSeconds);
-                        if (target < _reader.TotalTime) _reader.CurrentTime = target;
+                        Log.Error("播放失败: " + path, ex);
+                        CloseInternal();
+                        _currentPath = null;
+                        _outputFaulted = false;
+                        failedMessage = Describe(ex, path);
                     }
-
-                    _volumeProvider = new WaveChannel32(_reader) { Volume = _muted ? 0f : _volume, PadWithZeroes = false };
-                    _output = CreateOutput();
-                    _output.PlaybackStopped += OnPlaybackStopped;
-                    _output.Init(_volumeProvider);
-                    _currentPath = path;
-                    _output.Play();
-
-                    var started = PlaybackStarted;
-                    if (started != null) started();
-                    return true;
-                }
-                catch (Exception ex)
-                {
-                    Log.Error("播放失败: " + path, ex);
-                    CloseInternal();
-                    _currentPath = null;
-                    RaiseFailed(Describe(ex, path));
-                    return false;
                 }
             }
+
+            if (failedMessage != null)
+            {
+                RaiseFailed(failedMessage);
+                return false;
+            }
+
+            if (startedOk)
+            {
+                var started = PlaybackStarted;
+                if (started != null) started();
+                return true;
+            }
+
+            return false;
         }
 
         /// <summary>只加载不播放（用于恢复上次进度）。</summary>
@@ -200,28 +355,40 @@ namespace Lumen.Audio
             lock (_gate)
             {
                 if (_disposed) return false;
+                if (string.IsNullOrEmpty(path) || !File.Exists(path)) return false;
+
                 try
                 {
                     CloseInternal();
+
+                    long session = ++_sessionId;
                     _stoppingIntentionally = false;
+                    _outputFaulted = false;
+                    _lastPositionSeconds = 0;
+                    _lastDurationSeconds = 0;
+
                     _reader = OpenReader(path);
                     if (_reader == null) return false;
-                    if (startSeconds > 0.05)
-                    {
-                        var target = TimeSpan.FromSeconds(startSeconds);
-                        if (target < _reader.TotalTime) _reader.CurrentTime = target;
-                    }
-                    _volumeProvider = new WaveChannel32(_reader) { Volume = _muted ? 0f : _volume, PadWithZeroes = false };
-                    _output = CreateOutput();
-                    _output.PlaybackStopped += OnPlaybackStopped;
-                    _output.Init(_volumeProvider);
+
+                    ApplyStartPosition(_reader, startSeconds);
+                    IWaveProvider pipeline = BuildPipeline(_reader);
+                    var output = CreateAndInitOutput(pipeline);
+
+                    EventHandler<StoppedEventArgs> stoppedHandler = (s, e) => OnPlaybackStopped(session, s, e);
+                    output.PlaybackStopped += stoppedHandler;
+
+                    _output = output;
+                    _stoppedHandler = stoppedHandler;
                     _currentPath = path;
+                    UpdateCachedTimesUnsafe();
                     return true;
                 }
                 catch (Exception ex)
                 {
                     Log.Error("加载失败: " + path, ex);
                     CloseInternal();
+                    _currentPath = null;
+                    _outputFaulted = false;
                     return false;
                 }
             }
@@ -229,54 +396,168 @@ namespace Lumen.Audio
 
         public void Pause()
         {
-            var o = _output;
-            if (o == null) return;
-            try { if (o.PlaybackState == PlaybackState.Playing) o.Pause(); } catch (Exception ex) { Log.Warn("暂停失败: " + ex.Message); }
+            lock (_gate)
+            {
+                if (_disposed || _output == null) return;
+                try
+                {
+                    if (_output.PlaybackState == PlaybackState.Playing)
+                    {
+                        _output.Pause();
+                        UpdateCachedTimesUnsafe();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn("暂停失败: " + ex.Message);
+                }
+            }
         }
 
         public void Resume()
         {
-            var o = _output;
-            if (o == null) return;
-            try { if (o.PlaybackState != PlaybackState.Playing) o.Play(); } catch (Exception ex) { Log.Warn("继续失败: " + ex.Message); }
+            string rebuildPath = null;
+            double rebuildPosition = 0;
+
+            lock (_gate)
+            {
+                if (_disposed) return;
+
+                if (_output != null)
+                {
+                    try
+                    {
+                        if (_output.PlaybackState != PlaybackState.Playing)
+                        {
+                            _output.Play();
+                        }
+                        return;
+                    }
+                    catch (Exception ex)
+                    {
+                        Log.Warn("继续播放失败，尝试重建输出: " + ex.Message);
+                        UpdateCachedTimesUnsafe();
+                        DisposeOutputOnlyUnsafe();
+                        _outputFaulted = true;
+                    }
+                }
+
+                if (!string.IsNullOrEmpty(_currentPath))
+                {
+                    rebuildPath = _currentPath;
+                    rebuildPosition = _lastPositionSeconds;
+                }
+            }
+
+            if (!string.IsNullOrEmpty(rebuildPath))
+            {
+                Play(rebuildPath, rebuildPosition);
+            }
         }
 
         public void TogglePlayPause()
         {
-            if (!HasTrack) return;
-            if (IsPlaying) Pause(); else Resume();
+            bool shouldPause;
+            lock (_gate)
+            {
+                if (_disposed) return;
+                if (string.IsNullOrEmpty(_currentPath) || (_reader == null && !_outputFaulted)) return;
+                shouldPause = _output != null && _output.PlaybackState == PlaybackState.Playing;
+            }
+
+            if (shouldPause) Pause();
+            else Resume();
         }
 
         public void Stop()
         {
             lock (_gate)
             {
-                _stoppingIntentionally = true;
                 CloseInternal();
+                _currentPath = null;
+                _outputFaulted = false;
+                _lastPositionSeconds = 0;
+                _lastDurationSeconds = 0;
             }
         }
 
         /// <summary>跳转到指定秒数。</summary>
         public void Seek(double seconds)
         {
-            var r = _reader;
-            if (r == null) return;
-            try
+            lock (_gate)
             {
-                var total = r.TotalTime;
-                var target = TimeSpan.FromSeconds(Math.Max(0, seconds));
-                if (target > total) target = total;
-                r.CurrentTime = target;
-            }
-            catch (Exception ex)
-            {
-                Log.Warn("跳转失败: " + ex.Message);
+                if (_disposed) return;
+                double clampedSeconds = double.IsFinite(seconds) ? Math.Max(0, seconds) : 0;
+
+                if (_reader == null)
+                {
+                    if (_outputFaulted)
+                    {
+                        _lastPositionSeconds = _lastDurationSeconds > 0
+                            ? Math.Min(clampedSeconds, _lastDurationSeconds)
+                            : clampedSeconds;
+                    }
+                    return;
+                }
+
+                try
+                {
+                    var total = _reader.TotalTime;
+                    var target = TimeSpan.FromSeconds(clampedSeconds);
+                    if (total > TimeSpan.Zero && target > total) target = total;
+                    _reader.CurrentTime = target;
+                    _lastPositionSeconds = target.TotalSeconds;
+                    if (_eofTracker != null) _eofTracker.Reset();
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn("跳转失败: " + ex.Message);
+                }
             }
         }
 
         // ------------------------------------------------------------------
         // 内部
         // ------------------------------------------------------------------
+
+        private static void ApplyStartPosition(WaveStream reader, double startSeconds)
+        {
+            if (reader == null || !double.IsFinite(startSeconds) || startSeconds <= 0.05) return;
+            try
+            {
+                var target = TimeSpan.FromSeconds(startSeconds);
+                if (reader.TotalTime > TimeSpan.Zero && target < reader.TotalTime)
+                {
+                    reader.CurrentTime = target;
+                }
+            }
+            catch (Exception ex)
+            {
+                Log.Warn("设置起始播放位置失败: " + ex.Message);
+            }
+        }
+
+        /// <summary>
+        /// 构建 ISampleProvider 管线：
+        /// WaveStream -> ISampleProvider -> (多声道下混至立体声) -> VolumeSampleProvider -> EofTrackingSampleProvider -> SampleToWaveProvider。
+        /// </summary>
+        private IWaveProvider BuildPipeline(WaveStream reader)
+        {
+            ISampleProvider sampleProvider = reader.ToSampleProvider();
+
+            if (sampleProvider.WaveFormat.Channels > 2)
+            {
+                sampleProvider = new MultiplexingSampleProvider(new ISampleProvider[] { sampleProvider }, 2);
+            }
+
+            _volumeProvider = new VolumeSampleProvider(sampleProvider)
+            {
+                Volume = _muted ? 0f : _volume
+            };
+
+            _eofTracker = new EofTrackingSampleProvider(_volumeProvider);
+            return new SampleToWaveProvider(_eofTracker);
+        }
 
         /// <summary>
         /// 按扩展名选择解码器。MP3/AAC/M4A/WMA/MP4 走 Media Foundation，
@@ -301,65 +582,126 @@ namespace Lumen.Audio
             catch (Exception ex) { Log.Error("解码失败: " + ex.Message); return null; }
         }
 
-        /// <summary>优先 WASAPI 共享模式，失败回退 WaveOut。</summary>
-        private static IWavePlayer CreateOutput()
+        /// <summary>优先 WASAPI 共享模式，构造或 Init 失败时释放并回退 WaveOutEvent。</summary>
+        private static IWavePlayer CreateAndInitOutput(IWaveProvider provider)
         {
+            WasapiOut wasapi = null;
             try
             {
-                var wasapi = new WasapiOut(NAudio.CoreAudioApi.AudioClientShareMode.Shared, 100);
+                wasapi = new WasapiOut(AudioClientShareMode.Shared, 100);
+                wasapi.Init(provider);
                 Log.Info("音频输出: WASAPI 共享模式");
                 return wasapi;
             }
             catch (Exception ex)
             {
-                Log.Warn("WASAPI 不可用，回退 WaveOut: " + ex.Message);
-                return new WaveOutEvent { DesiredLatency = 200 };
+                if (wasapi != null)
+                {
+                    try { wasapi.Dispose(); } catch { }
+                }
+                Log.Warn("WASAPI 不可用或初始化失败，回退 WaveOut: " + ex.Message);
+            }
+
+            var waveOut = new WaveOutEvent { DesiredLatency = 200 };
+            try
+            {
+                waveOut.Init(provider);
+                Log.Info("音频输出: WaveOut 回退模式");
+                return waveOut;
+            }
+            catch
+            {
+                try { waveOut.Dispose(); } catch { }
+                throw;
             }
         }
 
-        private void OnPlaybackStopped(object sender, StoppedEventArgs e)
+        private void OnPlaybackStopped(long sessionId, object sender, StoppedEventArgs e)
         {
-            if (_stoppingIntentionally || _disposed) return;
+            bool raiseEnded = false;
+            string failedMessage = null;
 
-            // 忽略旧输出实例延迟到达的停止事件，避免影响新曲目。
-            if (!ReferenceEquals(sender, _output)) return;
+            lock (_gate)
+            {
+                if (_disposed || _stoppingIntentionally) return;
+                if (sessionId != _sessionId || !ReferenceEquals(sender, _output)) return;
 
-            // PlaybackStopped 不一定代表歌曲播放完毕：WASAPI 设备被拔出、
-            // 默认输出设备切换等情况也会停止播放流。只有读取位置确实到达
-            // 曲目末尾，才允许触发自动切歌。
-            bool reachedEnd = false;
-            var reader = _reader;
-            if (reader != null)
+                bool reachedEnd = _eofTracker != null && _eofTracker.ReachedEof;
+                Exception stopException = e != null ? e.Exception : null;
+
+                if (!reachedEnd)
+                {
+                    UpdateCachedTimesUnsafe();
+                    DisposeOutputOnlyUnsafe();
+                    _outputFaulted = true;
+
+                    if (stopException != null)
+                    {
+                        Log.Error("播放设备或播放流中断；已释放失效输出，不自动切歌", stopException);
+                    }
+                    else
+                    {
+                        Log.Warn("播放流在歌曲结束前停止；已释放失效输出，不自动切歌");
+                    }
+                    return;
+                }
+
+                if (stopException != null)
+                {
+                    Log.Error("曲目结束时播放流发生异常", stopException);
+                    UpdateCachedTimesUnsafe();
+                    DisposeOutputOnlyUnsafe();
+                    _outputFaulted = true;
+                    failedMessage = Describe(stopException, _currentPath);
+                }
+                else
+                {
+                    raiseEnded = true;
+                }
+            }
+
+            if (failedMessage != null)
+            {
+                RaiseFailed(failedMessage);
+            }
+            else if (raiseEnded)
+            {
+                var handler = PlaybackEnded;
+                if (handler != null) handler();
+            }
+        }
+
+        private void UpdateCachedTimesUnsafe()
+        {
+            if (_reader == null) return;
+            try
+            {
+                double pos = _reader.CurrentTime.TotalSeconds;
+                if (double.IsFinite(pos) && pos >= 0) _lastPositionSeconds = pos;
+            }
+            catch { }
+
+            try
+            {
+                double total = _reader.TotalTime.TotalSeconds;
+                if (total > 0 && double.IsFinite(total)) _lastDurationSeconds = total;
+            }
+            catch { }
+        }
+
+        private void DisposeOutputOnlyUnsafe()
+        {
+            if (_output != null)
             {
                 try
                 {
-                    var total = reader.TotalTime;
-                    var position = reader.CurrentTime;
-                    reachedEnd = total > TimeSpan.Zero &&
-                                 position >= total - TimeSpan.FromMilliseconds(300);
+                    if (_stoppedHandler != null) _output.PlaybackStopped -= _stoppedHandler;
                 }
                 catch { }
+                try { _output.Dispose(); } catch { }
+                _output = null;
             }
-
-            if (!reachedEnd)
-            {
-                if (e != null && e.Exception != null)
-                    Log.Error("播放设备或播放流中断；歌曲尚未播放结束，不自动切歌", e.Exception);
-                else
-                    Log.Warn("播放流在歌曲结束前停止；不自动切歌");
-                return;
-            }
-
-            if (e != null && e.Exception != null)
-            {
-                Log.Error("曲目结束时播放流发生异常", e.Exception);
-                RaiseFailed(Describe(e.Exception, _currentPath));
-                return;
-            }
-
-            // 只有确认到达曲目末尾，才视为自然结束。
-            var handler = PlaybackEnded;
-            if (handler != null) handler();
+            _stoppedHandler = null;
         }
 
         private void RaiseFailed(string message)
@@ -376,23 +718,30 @@ namespace Lumen.Audio
 
         private void CloseInternal()
         {
+            _stoppingIntentionally = true;
+            _sessionId++;
+
             if (_output != null)
             {
                 try
                 {
-                    _output.PlaybackStopped -= OnPlaybackStopped;
+                    if (_stoppedHandler != null) _output.PlaybackStopped -= _stoppedHandler;
                     _output.Stop();
                 }
                 catch { }
                 try { _output.Dispose(); } catch { }
                 _output = null;
             }
+            _stoppedHandler = null;
+
             if (_reader != null)
             {
                 try { _reader.Dispose(); } catch { }
                 _reader = null;
             }
+
             _volumeProvider = null;
+            _eofTracker = null;
         }
 
         public void Dispose()
@@ -400,9 +749,11 @@ namespace Lumen.Audio
             lock (_gate)
             {
                 _disposed = true;
-                _stoppingIntentionally = true;
                 CloseInternal();
                 _currentPath = null;
+                _outputFaulted = false;
+                _lastPositionSeconds = 0;
+                _lastDurationSeconds = 0;
             }
         }
     }

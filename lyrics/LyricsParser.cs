@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Globalization;
 using System.Text.RegularExpressions;
@@ -24,7 +24,25 @@ namespace Lumen.Lyrics
             new Regex(@"^\[(ti|ar|al|by|offset|re|ve|length)\s*:(.*)\]$",
                 RegexOptions.Compiled | RegexOptions.IgnoreCase);
 
-        private static readonly Regex VttTag = new Regex(@"<[^>]*>", RegexOptions.Compiled);
+        // 仅匹配合法 VTT/HTML 标签与 VTT 内部时间戳标签，避免误删 <合唱> 等正常文本
+        private static readonly Regex VttTag = new Regex(
+            @"<(?:/?(?:b|i|u|c|v|ruby|rt|lang|font)(?:\.[^>\s]+)*(?:\s+[^>]*)?|\d{1,2}:\d{2}(?::\d{2})?[.,]\d{1,3})>",
+            RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+        private static readonly Regex VttTimeLineRegex = new Regex(
+            @"(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3}|\d{1,2}:\d{2}[.,]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3}|\d{1,2}:\d{2}[.,]\d{1,3})",
+            RegexOptions.Compiled);
+
+        private static readonly Regex SrtTimeLineRegex = new Regex(
+            @"(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})",
+            RegexOptions.Compiled);
+
+        private static readonly Regex SrtSniffRegex = new Regex(
+            @"\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->",
+            RegexOptions.Compiled);
+
+        private static readonly Regex AssOverrideTag =
+            new Regex(@"\{[^}]*\}", RegexOptions.Compiled);
 
         /// <summary>按扩展名解析；扩展名不认识时自动嗅探内容。</summary>
         public static LyricsDocument Parse(string text, string path, double fallbackDuration)
@@ -46,45 +64,80 @@ namespace Lumen.Lyrics
             {
                 case ".lrc":
                     result = ParseLrc(text, fallbackDuration);
-                    // 扩展名是 .lrc 但里面没有时间轴：可能是别的格式被改了名
-                    if (result.IsEmpty) result = Sniff(text, fallbackDuration);
+                    // 扩展名是 .lrc 但里面没有时间轴：可能是别的格式被改了名，跳过已失败的 LRC
+                    if (result.IsEmpty) result = Sniff(text, fallbackDuration, "LRC");
                     return result;
                 case ".vtt":
                     result = ParseVtt(text, fallbackDuration);
-                    if (result.IsEmpty) return Sniff(text, fallbackDuration);
+                    if (result.IsEmpty) return Sniff(text, fallbackDuration, "WebVTT");
                     return result;
                 case ".srt":
                     result = ParseSrt(text, fallbackDuration);
-                    if (result.IsEmpty) return Sniff(text, fallbackDuration);
+                    if (result.IsEmpty) return Sniff(text, fallbackDuration, "SRT");
                     return result;
                 case ".ass":
+                    result = ParseAss(text, fallbackDuration, "ASS");
+                    if (result.IsEmpty) return Sniff(text, fallbackDuration, "ASS");
+                    return result;
                 case ".ssa":
-                    result = ParseAss(text, fallbackDuration);
-                    if (result.IsEmpty) return Sniff(text, fallbackDuration);
+                    result = ParseAss(text, fallbackDuration, "SSA");
+                    if (result.IsEmpty) return Sniff(text, fallbackDuration, "ASS");
                     return result;
                 case ".txt":
                     result = ParsePlain(text);
                     // .txt 里可能是带时间轴的歌词，嗅探一下更保险
                     if (!result.IsEmpty)
                     {
-                        var sniffed = Sniff(text, fallbackDuration);
+                        var sniffed = Sniff(text, fallbackDuration, null);
                         if (sniffed.IsSynced && !sniffed.IsEmpty) return sniffed;
                     }
                     return result;
             }
 
             // 按内容嗅探
-            return Sniff(text, fallbackDuration);
+            return Sniff(text, fallbackDuration, null);
         }
 
         /// <summary>内容嗅探。</summary>
         public static LyricsDocument Sniff(string text, double fallbackDuration)
         {
-            if (text.IndexOf("WEBVTT", StringComparison.OrdinalIgnoreCase) >= 0) return ParseVtt(text, fallbackDuration);
-            if (text.IndexOf("[Script Info]", StringComparison.OrdinalIgnoreCase) >= 0 ||
-                text.IndexOf("Dialogue:", StringComparison.OrdinalIgnoreCase) >= 0) return ParseAss(text, fallbackDuration);
-            if (LrcTimeTag.IsMatch(text)) return ParseLrc(text, fallbackDuration);
-            if (Regex.IsMatch(text, @"\d{1,2}:\d{2}:\d{2}[,.]\d{1,3}\s*-->")) return ParseSrt(text, fallbackDuration);
+            return Sniff(text, fallbackDuration, null);
+        }
+
+        private static LyricsDocument Sniff(string text, double fallbackDuration, string skipFormat)
+        {
+            if (string.IsNullOrWhiteSpace(text)) return new LyricsDocument { FormatName = "空" };
+
+            if (!string.Equals(skipFormat, "WebVTT", StringComparison.OrdinalIgnoreCase) &&
+                text.IndexOf("WEBVTT", StringComparison.OrdinalIgnoreCase) >= 0)
+            {
+                var doc = ParseVtt(text, fallbackDuration);
+                if (!doc.IsEmpty) return doc;
+            }
+
+            if (!string.Equals(skipFormat, "ASS", StringComparison.OrdinalIgnoreCase) &&
+                (text.IndexOf("[Script Info]", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                 text.IndexOf("Dialogue:", StringComparison.OrdinalIgnoreCase) >= 0))
+            {
+                var formatName = text.IndexOf("[V4 Styles]", StringComparison.OrdinalIgnoreCase) >= 0 ? "SSA" : "ASS";
+                var doc = ParseAss(text, fallbackDuration, formatName);
+                if (!doc.IsEmpty) return doc;
+            }
+
+            if (!string.Equals(skipFormat, "LRC", StringComparison.OrdinalIgnoreCase) &&
+                LrcTimeTag.IsMatch(text))
+            {
+                var doc = ParseLrc(text, fallbackDuration);
+                if (!doc.IsEmpty) return doc;
+            }
+
+            if (!string.Equals(skipFormat, "SRT", StringComparison.OrdinalIgnoreCase) &&
+                SrtSniffRegex.IsMatch(text))
+            {
+                var doc = ParseSrt(text, fallbackDuration);
+                if (!doc.IsEmpty) return doc;
+            }
+
             return ParsePlain(text);
         }
 
@@ -92,11 +145,20 @@ namespace Lumen.Lyrics
         // LRC
         // ------------------------------------------------------------------
 
+        private struct RawLrcEntry
+        {
+            public double Time;
+            public int Order;
+            public string Text;
+        }
+
         private static LyricsDocument ParseLrc(string text, double fallbackDuration)
         {
             var doc = new LyricsDocument { IsSynced = true, FormatName = "LRC" };
             double offset = 0;
             var lines = SplitLines(text);
+            var rawEntries = new List<RawLrcEntry>();
+            int order = 0;
 
             foreach (var raw in lines)
             {
@@ -110,7 +172,8 @@ namespace Lumen.Lyrics
                     {
                         double parsed;
                         if (double.TryParse(meta.Groups[2].Value.Trim(), NumberStyles.Float,
-                                CultureInfo.InvariantCulture, out parsed))
+                                CultureInfo.InvariantCulture, out parsed) &&
+                            !double.IsNaN(parsed) && !double.IsInfinity(parsed))
                         {
                             // offset 单位是毫秒，正数表示歌词提前
                             offset = -parsed / 1000.0;
@@ -126,46 +189,112 @@ namespace Lumen.Lyrics
                 var content = LrcTimeTag.Replace(line, string.Empty);
                 // 去掉增强型逐字标签（压平，不做卡拉OK变色）
                 content = LrcWordTag.Replace(content, string.Empty).Trim();
-                if (content.Length == 0) continue;
 
-                // 一行多时间标签：每个标签都生成一行
+                // 一行多时间标签：每个标签都生成一条原始记录（含空文本间奏截断标记）
                 foreach (Match m in matches)
                 {
-                    double seconds = ToSeconds(m.Groups[1].Value, m.Groups[2].Value, m.Groups[3].Value) + offset;
-                    if (seconds < 0) seconds = 0;
-                    doc.Lines.Add(new LyricLine(seconds, content));
+                    double seconds;
+                    if (!TryToSeconds(m.Groups[1].Value, m.Groups[2].Value, m.Groups[3].Value, out seconds))
+                        continue;
+
+                    rawEntries.Add(new RawLrcEntry
+                    {
+                        Time = seconds,
+                        Order = order++,
+                        Text = content
+                    });
                 }
             }
 
-            doc.Lines.Sort((a, b) => a.Time.CompareTo(b.Time));
+            // 统一叠加 offset（解决后置 [offset:] 滞后问题），截断 < 0 为 0
+            for (int i = 0; i < rawEntries.Count; i++)
+            {
+                var entry = rawEntries[i];
+                double adjusted = entry.Time + offset;
+                if (adjusted < 0) adjusted = 0;
+                entry.Time = adjusted;
+                rawEntries[i] = entry;
+            }
+
+            // 稳定排序：时间升序，同时间按原行号升序
+            rawEntries.Sort((a, b) =>
+            {
+                int cmp = a.Time.CompareTo(b.Time);
+                return cmp != 0 ? cmp : a.Order.CompareTo(b.Order);
+            });
+
+            // 单遍合并同时间戳双语行，并用空文本时间点截断前一句的 EndTime
+            for (int i = 0; i < rawEntries.Count; i++)
+            {
+                var entry = rawEntries[i];
+                if (entry.Text.Length == 0)
+                {
+                    if (doc.Lines.Count > 0)
+                    {
+                        var prev = doc.Lines[doc.Lines.Count - 1];
+                        if (entry.Time > prev.Time && prev.EndTime <= prev.Time)
+                        {
+                            prev.EndTime = entry.Time;
+                        }
+                    }
+                    continue;
+                }
+
+                if (doc.Lines.Count > 0 && Math.Abs(doc.Lines[doc.Lines.Count - 1].Time - entry.Time) < 0.001)
+                {
+                    doc.Lines[doc.Lines.Count - 1].AppendText(entry.Text);
+                }
+                else
+                {
+                    doc.Lines.Add(new LyricLine(entry.Time, entry.Text));
+                }
+            }
+
             if (doc.Lines.Count == 0) doc.IsSynced = false;
             doc.FillEndTimes(fallbackDuration);
             return doc;
         }
 
-        private static double ToSeconds(string mm, string ss, string frac)
+        private static bool TryToSeconds(string mm, string ss, string frac, out double totalSeconds)
         {
-            double minutes = double.Parse(mm, CultureInfo.InvariantCulture);
-            double seconds = double.Parse(ss, CultureInfo.InvariantCulture);
+            totalSeconds = 0;
+            double minutes, seconds;
+            if (!double.TryParse(mm, NumberStyles.Integer, CultureInfo.InvariantCulture, out minutes)) return false;
+            if (!double.TryParse(ss, NumberStyles.Integer, CultureInfo.InvariantCulture, out seconds)) return false;
+
             double fraction = 0;
             if (!string.IsNullOrEmpty(frac))
             {
-                double value = double.Parse(frac, CultureInfo.InvariantCulture);
+                double value;
+                if (!double.TryParse(frac, NumberStyles.Integer, CultureInfo.InvariantCulture, out value)) return false;
                 // 1 位 = 十分之一秒，2 位 = 百分之一秒，3 位 = 毫秒
                 fraction = value / Math.Pow(10, frac.Length);
             }
-            return minutes * 60 + seconds + fraction;
+
+            double result = minutes * 60 + seconds + fraction;
+            if (double.IsNaN(result) || double.IsInfinity(result) || result < 0) return false;
+            totalSeconds = result;
+            return true;
         }
 
         // ------------------------------------------------------------------
         // WebVTT
         // ------------------------------------------------------------------
 
+        private struct RawCue
+        {
+            public double Start;
+            public double End;
+            public int Order;
+            public string Text;
+        }
+
         private static LyricsDocument ParseVtt(string text, double fallbackDuration)
         {
             var doc = new LyricsDocument { IsSynced = true, FormatName = "WebVTT" };
             var lines = SplitLines(text);
-            var timeLineRegex = new Regex(@"(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3}|\d{1,2}:\d{2}[.,]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[.,]\d{1,3}|\d{1,2}:\d{2}[.,]\d{1,3})");
+            var rawCues = new List<RawCue>();
+            int order = 0;
 
             int i = 0;
             while (i < lines.Count)
@@ -179,39 +308,65 @@ namespace Lumen.Lyrics
                     continue;
                 }
 
-                var m = timeLineRegex.Match(line);
+                var m = VttTimeLineRegex.Match(line);
                 if (!m.Success) { i++; continue; }
 
-                double start = ParseVttTime(m.Groups[1].Value);
-                double end = ParseVttTime(m.Groups[2].Value);
+                double start;
+                if (!TryParseVttTime(m.Groups[1].Value, out start)) { i++; continue; }
+
+                double end;
+                if (!TryParseVttTime(m.Groups[2].Value, out end) || end <= start) end = -1;
 
                 // 收集 cue 文本直到空行，多行合并
                 var parts = new List<string>();
                 i++;
                 while (i < lines.Count && lines[i].Trim().Length > 0)
                 {
-                    // cue 的标识行（纯数字或名字）在时间行之前，这里不会遇到
                     parts.Add(CleanVttText(lines[i]));
                     i++;
                 }
 
-                // 同一时间重复出现则追加
                 var merged = string.Join(" ", parts).Trim();
                 if (merged.Length > 0)
                 {
-                    var existing = doc.Lines.Find(x => Math.Abs(x.Time - start) < 0.001);
-                    if (existing != null) existing.Text = (existing.Text + " " + merged).Trim();
-                    else doc.Lines.Add(new LyricLine(start, merged) { EndTime = end });
+                    rawCues.Add(new RawCue
+                    {
+                        Start = start,
+                        End = end,
+                        Order = order++,
+                        Text = merged
+                    });
                 }
             }
 
-            doc.Lines.Sort((a, b) => a.Time.CompareTo(b.Time));
+            // 先排序再单遍合并（O(N log N)）
+            rawCues.Sort((a, b) =>
+            {
+                int cmp = a.Start.CompareTo(b.Start);
+                return cmp != 0 ? cmp : a.Order.CompareTo(b.Order);
+            });
+
+            for (int k = 0; k < rawCues.Count; k++)
+            {
+                var cue = rawCues[k];
+                if (doc.Lines.Count > 0 && Math.Abs(doc.Lines[doc.Lines.Count - 1].Time - cue.Start) < 0.001)
+                {
+                    var existing = doc.Lines[doc.Lines.Count - 1];
+                    existing.Text = (existing.Text + " " + cue.Text).Trim();
+                    existing.EndTime = Math.Max(existing.EndTime, cue.End);
+                }
+                else
+                {
+                    doc.Lines.Add(new LyricLine(cue.Start, cue.Text) { EndTime = cue.End });
+                }
+            }
+
             if (doc.Lines.Count == 0) doc.IsSynced = false;
             doc.FillEndTimes(fallbackDuration);
             return doc;
         }
 
-        /// <summary>去掉 &lt;v 说话人&gt;、&lt;c.class&gt; 等标签以及 VTT 实体。</summary>
+        /// <summary>去掉 &lt;v 说话人&gt;、&lt;c.class&gt; 等合法标签以及 VTT 实体。</summary>
         private static string CleanVttText(string input)
         {
             var s = VttTag.Replace(input, string.Empty);
@@ -220,21 +375,45 @@ namespace Lumen.Lyrics
             return s.Trim();
         }
 
-        private static double ParseVttTime(string value)
+        private static bool TryParseVttTime(string value, out double seconds)
         {
-            value = value.Replace(',', '.');
-            var parts = value.Split(':');
-            double seconds = 0;
+            seconds = 0;
+            if (string.IsNullOrWhiteSpace(value)) return false;
+
+            var normalized = value.Trim().Replace(',', '.');
+            var parts = normalized.Split(':');
+            double result;
+
             if (parts.Length == 3)
-                seconds = double.Parse(parts[0], CultureInfo.InvariantCulture) * 3600
-                        + double.Parse(parts[1], CultureInfo.InvariantCulture) * 60
-                        + double.Parse(parts[2], CultureInfo.InvariantCulture);
+            {
+                double h, m, s;
+                if (!double.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out h) ||
+                    !double.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out m) ||
+                    !double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out s))
+                {
+                    return false;
+                }
+                result = h * 3600 + m * 60 + s;
+            }
             else if (parts.Length == 2)
-                seconds = double.Parse(parts[0], CultureInfo.InvariantCulture) * 60
-                        + double.Parse(parts[1], CultureInfo.InvariantCulture);
+            {
+                double m, s;
+                if (!double.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out m) ||
+                    !double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out s))
+                {
+                    return false;
+                }
+                result = m * 60 + s;
+            }
             else
-                double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out seconds);
-            return seconds;
+            {
+                if (!double.TryParse(normalized, NumberStyles.Float, CultureInfo.InvariantCulture, out result))
+                    return false;
+            }
+
+            if (double.IsNaN(result) || double.IsInfinity(result) || result < 0) return false;
+            seconds = result;
+            return true;
         }
 
         // ------------------------------------------------------------------
@@ -245,16 +424,18 @@ namespace Lumen.Lyrics
         {
             var doc = new LyricsDocument { IsSynced = true, FormatName = "SRT" };
             var lines = SplitLines(text);
-            var arrow = new Regex(@"(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})\s*-->\s*(\d{1,2}:\d{2}:\d{2}[,.]\d{1,3})");
 
             int i = 0;
             while (i < lines.Count)
             {
-                var m = arrow.Match(lines[i]);
+                var m = SrtTimeLineRegex.Match(lines[i]);
                 if (!m.Success) { i++; continue; }
 
-                double start = ParseVttTime(m.Groups[1].Value);
-                double end = ParseVttTime(m.Groups[2].Value);
+                double start;
+                if (!TryParseVttTime(m.Groups[1].Value, out start)) { i++; continue; }
+
+                double end;
+                if (!TryParseVttTime(m.Groups[2].Value, out end) || end <= start) end = -1;
 
                 var parts = new List<string>();
                 i++;
@@ -278,19 +459,36 @@ namespace Lumen.Lyrics
         // ASS / SSA
         // ------------------------------------------------------------------
 
-        private static readonly Regex AssOverrideTag = new Regex(@"\{[^}]*\}", RegexOptions.Compiled);
-
-        private static LyricsDocument ParseAss(string text, double fallbackDuration)
+        private static LyricsDocument ParseAss(string text, double fallbackDuration, string formatName = "ASS")
         {
-            var doc = new LyricsDocument { IsSynced = true, FormatName = "ASS" };
+            var doc = new LyricsDocument
+            {
+                IsSynced = true,
+                FormatName = string.IsNullOrEmpty(formatName) ? "ASS" : formatName
+            };
             var lines = SplitLines(text);
 
-            string[] fields = null;   // Format: 行给出的列顺序
+            string[] fields = null;   // [Events] 节内 Format: 行给出的列顺序
             var events = new List<string[]>();
+            bool hasSectionHeader = false;
+            bool inEvents = false;
 
             foreach (var raw in lines)
             {
                 var line = raw.Trim();
+                if (line.Length == 0 || line[0] == ';') continue;
+
+                // 节头切换：[Script Info] / [V4+ Styles] / [Events] 等
+                if (line[0] == '[' && line[line.Length - 1] == ']')
+                {
+                    hasSectionHeader = true;
+                    inEvents = line.Equals("[Events]", StringComparison.OrdinalIgnoreCase);
+                    continue;
+                }
+
+                // 仅在 [Events] 节内（或无任何节头的裸片段中）解析 Format 与 Dialogue，避免被 [V4+ Styles] 抢占
+                if (!inEvents && hasSectionHeader) continue;
+
                 if (line.StartsWith("Format:", StringComparison.OrdinalIgnoreCase) && fields == null)
                 {
                     fields = SplitAssFields(line.Substring("Format:".Length), -1);
@@ -316,8 +514,16 @@ namespace Lumen.Lyrics
             {
                 if (ev.Length <= textIdx || ev.Length <= startIdx) continue;
 
-                double start = ParseAssTime(ev[startIdx]);
-                double end = endIdx >= 0 && ev.Length > endIdx ? ParseAssTime(ev[endIdx]) : -1;
+                double start;
+                if (!TryParseAssTime(ev[startIdx], out start)) continue;
+
+                double end = -1;
+                if (endIdx >= 0 && ev.Length > endIdx)
+                {
+                    double parsedEnd;
+                    if (TryParseAssTime(ev[endIdx], out parsedEnd) && parsedEnd > start)
+                        end = parsedEnd;
+                }
 
                 // 去掉 {\pos(...)} 之类的样式覆盖；\N 换行转空格
                 var content = AssOverrideTag.Replace(ev[textIdx], string.Empty)
@@ -364,21 +570,35 @@ namespace Lumen.Lyrics
             return -1;
         }
 
-        /// <summary>ASS 时间：H:MM:SS.cc（百分之一秒）。</summary>
-        private static double ParseAssTime(string value)
+        /// <summary>ASS 时间：H:MM:SS.cc（百分之一秒），安全 TryParse。</summary>
+        private static bool TryParseAssTime(string value, out double seconds)
         {
-            value = (value ?? string.Empty).Trim();
-            var parts = value.Split(':');
+            seconds = 0;
+            var trimmed = (value ?? string.Empty).Trim();
+            if (trimmed.Length == 0) return false;
+
+            var parts = trimmed.Split(':');
+            double result;
             if (parts.Length == 3)
             {
-                double h = double.Parse(parts[0], CultureInfo.InvariantCulture);
-                double m = double.Parse(parts[1], CultureInfo.InvariantCulture);
-                double s = double.Parse(parts[2], CultureInfo.InvariantCulture);
-                return h * 3600 + m * 60 + s;
+                double h, m, s;
+                if (!double.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out h) ||
+                    !double.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out m) ||
+                    !double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out s))
+                {
+                    return false;
+                }
+                result = h * 3600 + m * 60 + s;
             }
-            double result;
-            double.TryParse(value, NumberStyles.Float, CultureInfo.InvariantCulture, out result);
-            return result;
+            else
+            {
+                if (!double.TryParse(trimmed, NumberStyles.Float, CultureInfo.InvariantCulture, out result))
+                    return false;
+            }
+
+            if (double.IsNaN(result) || double.IsInfinity(result) || result < 0) return false;
+            seconds = result;
+            return true;
         }
 
         // ------------------------------------------------------------------

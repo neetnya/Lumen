@@ -1,10 +1,11 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
 using System.Windows.Media.Animation;
+using System.Windows.Threading;
 using Lumen.Lyrics;
 
 namespace Lumen.UI
@@ -16,15 +17,40 @@ namespace Lumen.UI
     /// </summary>
     public sealed class LyricsPane : Grid
     {
+        private static readonly DependencyProperty AnimatedVerticalOffsetProperty =
+            DependencyProperty.RegisterAttached(
+                "AnimatedVerticalOffset",
+                typeof(double),
+                typeof(LyricsPane),
+                new PropertyMetadata(0.0, OnAnimatedVerticalOffsetChanged));
+
+        private static void OnAnimatedVerticalOffsetChanged(DependencyObject d, DependencyPropertyChangedEventArgs e)
+        {
+            var sv = d as ScrollViewer;
+            if (sv == null) return;
+            var pane = sv.Tag as LyricsPane;
+            if (pane != null) pane._isProgrammaticScroll = true;
+            try
+            {
+                sv.ScrollToVerticalOffset((double)e.NewValue);
+            }
+            finally
+            {
+                if (pane != null) pane._isProgrammaticScroll = false;
+            }
+        }
+
         private readonly ScrollViewer _scroll;
         private readonly StackPanel _stack;
         private readonly TextBlock _empty;
         private readonly List<TextBlock> _lines = new List<TextBlock>();
+        private readonly DispatcherTimer _resumeAutoScrollTimer;
 
         private LyricsDocument _doc;
         private int _current = -2;
+        private int _hoveredIndex = -1;
         private bool _userScrolling;
-        private DateTime _lastAutoScroll = DateTime.MinValue;
+        private bool _isProgrammaticScroll;
 
         /// <summary>点击某句歌词（参数为秒）。</summary>
         public event Action<double> LineClicked;
@@ -37,7 +63,7 @@ namespace Lumen.UI
             _stack = new StackPanel
             {
                 Margin = new Thickness(28, 24, 28, 60),
-                VerticalAlignment = VerticalAlignment.Center
+                VerticalAlignment = VerticalAlignment.Top
             };
 
             _scroll = new ScrollViewer
@@ -45,10 +71,12 @@ namespace Lumen.UI
                 VerticalScrollBarVisibility = ScrollBarVisibility.Hidden,
                 HorizontalScrollBarVisibility = ScrollBarVisibility.Disabled,
                 Content = _stack,
-                CanContentScroll = false
+                CanContentScroll = false,
+                Tag = this
             };
             _scroll.ScrollChanged += OnScrollChanged;
             _scroll.PreviewMouseWheel += OnMouseWheel;
+            _scroll.SizeChanged += delegate { UpdateVerticalPadding(); };
             Children.Add(_scroll);
 
             _empty = new TextBlock
@@ -60,6 +88,35 @@ namespace Lumen.UI
                 VerticalAlignment = VerticalAlignment.Center
             };
             Children.Add(_empty);
+
+            _resumeAutoScrollTimer = new DispatcherTimer
+            {
+                Interval = TimeSpan.FromSeconds(3)
+            };
+            _resumeAutoScrollTimer.Tick += delegate
+            {
+                _resumeAutoScrollTimer.Stop();
+                _userScrolling = false;
+                if (_doc != null && _doc.IsSynced && _current >= 0)
+                {
+                    CenterLine(_current);
+                }
+            };
+        }
+
+        private void UpdateVerticalPadding()
+        {
+            double vh = _scroll.ViewportHeight;
+            if (vh <= 0) vh = _scroll.ActualHeight;
+
+            if (_doc != null && !_doc.IsSynced)
+            {
+                _stack.Margin = new Thickness(28, 24, 28, 40);
+                return;
+            }
+
+            double pad = vh > 40 ? Math.Max(24, vh / 2.0 - 20.0) : 24.0;
+            _stack.Margin = new Thickness(28, pad, 28, pad);
         }
 
         // ------------------------------------------------------------------
@@ -70,6 +127,20 @@ namespace Lumen.UI
             _lines.Clear();
             _stack.Children.Clear();
             _current = -2;
+            _hoveredIndex = -1;
+            _userScrolling = false;
+            _resumeAutoScrollTimer.Stop();
+
+            _scroll.BeginAnimation(AnimatedVerticalOffsetProperty, null);
+            _isProgrammaticScroll = true;
+            try
+            {
+                _scroll.ScrollToVerticalOffset(0);
+            }
+            finally
+            {
+                _isProgrammaticScroll = false;
+            }
 
             if (doc == null || doc.IsEmpty)
             {
@@ -80,6 +151,9 @@ namespace Lumen.UI
 
             _empty.Visibility = Visibility.Collapsed;
             _scroll.Visibility = Visibility.Visible;
+
+            bool synced = doc.IsSynced;
+            UpdateVerticalPadding();
 
             for (int i = 0; i < doc.Lines.Count; i++)
             {
@@ -95,21 +169,19 @@ namespace Lumen.UI
                     LineHeight = 24,
                     Margin = new Thickness(0, 7, 0, 7),
                     Foreground = Theme.Brush("Brush.TextDim"),
-                    Cursor = Cursors.Hand,
+                    Cursor = synced ? Cursors.Hand : Cursors.Arrow,
                     Tag = i
                 };
-                block.MouseLeftButtonUp += OnLineClick;
-                block.MouseEnter += OnLineEnter;
-                block.MouseLeave += OnLineLeave;
+
+                if (synced)
+                {
+                    block.MouseLeftButtonUp += OnLineClick;
+                    block.MouseEnter += OnLineEnter;
+                    block.MouseLeave += OnLineLeave;
+                }
 
                 _lines.Add(block);
                 _stack.Children.Add(block);
-            }
-
-            if (!doc.IsSynced)
-            {
-                // 纯文本：不做同步，顶到最上面
-                _scroll.ScrollToVerticalOffset(0);
             }
         }
 
@@ -127,9 +199,11 @@ namespace Lumen.UI
 
         private void OnLineEnter(object sender, MouseEventArgs e)
         {
+            if (_doc == null || !_doc.IsSynced) return;
             var block = sender as TextBlock;
             if (block == null) return;
             int index = (int)block.Tag;
+            _hoveredIndex = index;
             if (index == _current) return;
             block.Foreground = Theme.Brush("Brush.Text");
         }
@@ -139,22 +213,28 @@ namespace Lumen.UI
             var block = sender as TextBlock;
             if (block == null) return;
             int index = (int)block.Tag;
+            if (_hoveredIndex == index) _hoveredIndex = -1;
             if (index == _current) return;
             block.Foreground = Theme.Brush("Brush.TextDim");
         }
 
         private void OnMouseWheel(object sender, MouseWheelEventArgs e)
         {
-            // 用户手动滚动后，暂停自动居中几秒
+            // 用户手动滚动后，停止当前平滑滚动动画并暂停自动居中 3 秒
+            _scroll.BeginAnimation(AnimatedVerticalOffsetProperty, null);
             _userScrolling = true;
-            _lastAutoScroll = DateTime.UtcNow;
+            _resumeAutoScrollTimer.Stop();
+            _resumeAutoScrollTimer.Start();
         }
 
         private void OnScrollChanged(object sender, ScrollChangedEventArgs e)
         {
-            if (e.ExtentHeightChange == 0 && e.VerticalChange != 0)
+            if (_isProgrammaticScroll) return;
+            if (e.ExtentHeightChange == 0 && Math.Abs(e.VerticalChange) > 0.01)
             {
-                _lastAutoScroll = DateTime.UtcNow;
+                _userScrolling = true;
+                _resumeAutoScrollTimer.Stop();
+                _resumeAutoScrollTimer.Start();
             }
         }
 
@@ -167,44 +247,51 @@ namespace Lumen.UI
 
             if (!_doc.IsSynced)
             {
-                // 纯文本：按播放比例缓慢滚动，便于跟读
+                // 纯文本：不做同步高亮
                 return;
             }
 
             int index = _doc.IndexAt(seconds);
             if (index == _current) return;
+
+            int oldIndex = _current;
             _current = index;
 
-            ApplyHighlight(index);
-            if (!_userScrolling || (DateTime.UtcNow - _lastAutoScroll).TotalSeconds > 3)
+            ApplyHighlight(oldIndex, index);
+            if (!_userScrolling && index >= 0)
             {
-                _userScrolling = false;
-                CenterLine(index);
+                int targetIndex = index;
+                Dispatcher.BeginInvoke(DispatcherPriority.Loaded, new Action(delegate
+                {
+                    if (!_userScrolling && _current == targetIndex)
+                    {
+                        CenterLine(targetIndex);
+                    }
+                }));
             }
         }
 
-        private void ApplyHighlight(int index)
+        private void ApplyHighlight(int oldIndex, int newIndex)
         {
-            for (int i = 0; i < _lines.Count; i++)
+            if (oldIndex >= 0 && oldIndex < _lines.Count && oldIndex != newIndex)
             {
-                var block = _lines[i];
+                var prev = _lines[oldIndex];
+                prev.FontSize = 15;
+                prev.FontWeight = FontWeights.Normal;
+                prev.Foreground = oldIndex == _hoveredIndex
+                    ? Theme.Brush("Brush.Text")
+                    : Theme.Brush("Brush.TextDim");
+                prev.Opacity = 1.0;
+            }
 
-                if (i == index)
-                {
-                    // 当前行高亮放大
-                    block.FontSize = 19;
-                    block.FontWeight = FontWeights.SemiBold;
-                    block.Foreground = Theme.Brush("Brush.Accent");
-                }
-                else
-                {
-                    // 其余行统一亮度，不做渐变淡出
-                    block.FontSize = 15;
-                    block.FontWeight = FontWeights.Normal;
-                    block.Foreground = Theme.Brush("Brush.TextDim");
-                }
-
-                block.Opacity = 1.0;
+            if (newIndex >= 0 && newIndex < _lines.Count)
+            {
+                var curr = _lines[newIndex];
+                // 当前行高亮放大
+                curr.FontSize = 19;
+                curr.FontWeight = FontWeights.SemiBold;
+                curr.Foreground = Theme.Brush("Brush.Accent");
+                curr.Opacity = 1.0;
             }
         }
 
@@ -218,26 +305,32 @@ namespace Lumen.UI
                 // 让当前行居中：目标偏移 = 行中心 - 视口一半
                 var transform = block.TransformToAncestor(_stack);
                 var pos = transform.Transform(new Point(0, 0));
-                double lineCenter = pos.Y + block.ActualHeight / 2;
-                double target = lineCenter - _scroll.ViewportHeight / 2 + _stack.Margin.Top;
+                double lineCenter = pos.Y + block.ActualHeight / 2.0;
+                double target = lineCenter - _scroll.ViewportHeight / 2.0 + _stack.Margin.Top;
 
                 target = Math.Max(0, Math.Min(target, _scroll.ScrollableHeight));
 
-                var animation = new DoubleAnimation(target, TimeSpan.FromMilliseconds(260))
+                var animation = new DoubleAnimation
                 {
+                    From = _scroll.VerticalOffset,
+                    To = target,
+                    Duration = TimeSpan.FromMilliseconds(260),
                     EasingFunction = new CubicEase { EasingMode = EasingMode.EaseOut }
                 };
-                _scroll.BeginAnimation(ScrollViewer.VerticalOffsetProperty, null);
-                _scroll.ScrollToVerticalOffset(target);
+                _scroll.BeginAnimation(AnimatedVerticalOffsetProperty, animation, HandoffBehavior.SnapshotAndReplace);
             }
-            catch { }
+            catch (Exception ex)
+            {
+                Log.Warn("歌词自动居中滚动失败: " + ex.Message);
+            }
         }
 
         /// <summary>清空高亮（停止播放时）。</summary>
         public void ClearHighlight()
         {
+            int oldIndex = _current;
             _current = -2;
-            ApplyHighlight(-1);
+            ApplyHighlight(oldIndex, -1);
         }
     }
 }

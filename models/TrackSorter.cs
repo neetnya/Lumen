@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Globalization;
 using Lumen.Models;
 
 namespace Lumen
@@ -22,36 +23,56 @@ namespace Lumen
         public static List<Track> Sort(Group group, string mode)
         {
             var result = new List<Track>();
-            if (group == null) return result;
+            if (group == null || group.Tracks == null) return result;
 
-            // 打乱顺序优先（存在配置里，重启后仍是这个顺序）
+            // 打乱顺序优先（存在配置里，重启后仍是这个顺序），O(N) 去重
             if (group.ShuffledOrder != null && group.ShuffledOrder.Count > 0)
             {
                 var map = new Dictionary<string, Track>(StringComparer.OrdinalIgnoreCase);
-                foreach (var t in group.Tracks) map[t.Path] = t;
+                foreach (var t in group.Tracks)
+                {
+                    if (t != null && !string.IsNullOrEmpty(t.Path))
+                        map[t.Path] = t;
+                }
 
+                var added = new HashSet<Track>();
                 foreach (var path in group.ShuffledOrder)
                 {
+                    if (string.IsNullOrEmpty(path)) continue;
                     Track t;
-                    if (map.TryGetValue(path, out t) && !result.Contains(t)) result.Add(t);
+                    if (map.TryGetValue(path, out t) && added.Add(t))
+                        result.Add(t);
                 }
+
                 // 打乱后新导入的曲目接在后面
                 foreach (var t in group.Tracks)
                 {
-                    if (!result.Contains(t)) result.Add(t);
+                    if (t != null && added.Add(t))
+                        result.Add(t);
                 }
                 return result;
             }
 
-            result.AddRange(group.Tracks);
+            foreach (var t in group.Tracks)
+            {
+                if (t != null) result.Add(t);
+            }
 
             switch (mode)
             {
                 case Title:
-                    result.Sort((a, b) => string.Compare(a.Title, b.Title, StringComparison.CurrentCultureIgnoreCase));
+                    result.Sort((a, b) =>
+                    {
+                        int c = CompareNatural(a.Title, b.Title);
+                        return c != 0 ? c : a.AddedOrder.CompareTo(b.AddedOrder);
+                    });
                     break;
                 case TitleDesc:
-                    result.Sort((a, b) => string.Compare(b.Title, a.Title, StringComparison.CurrentCultureIgnoreCase));
+                    result.Sort((a, b) =>
+                    {
+                        int c = CompareNatural(b.Title, a.Title);
+                        return c != 0 ? c : a.AddedOrder.CompareTo(b.AddedOrder);
+                    });
                     break;
                 case Duration:
                     result.Sort((a, b) => CompareDuration(a, b, true));
@@ -62,13 +83,18 @@ namespace Lumen
                 case Format:
                     result.Sort((a, b) =>
                     {
-                        int c = string.Compare(a.Format, b.Format, StringComparison.OrdinalIgnoreCase);
+                        int c = string.Compare(a.Format ?? string.Empty, b.Format ?? string.Empty, StringComparison.OrdinalIgnoreCase);
                         if (c != 0) return c;
-                        return string.Compare(a.Title, b.Title, StringComparison.CurrentCultureIgnoreCase);
+                        c = CompareNatural(a.Title, b.Title);
+                        return c != 0 ? c : a.AddedOrder.CompareTo(b.AddedOrder);
                     });
                     break;
                 case Path:
-                    result.Sort((a, b) => string.Compare(a.Path, b.Path, StringComparison.CurrentCultureIgnoreCase));
+                    result.Sort((a, b) =>
+                    {
+                        int c = CompareNatural(a.Path, b.Path);
+                        return c != 0 ? c : a.AddedOrder.CompareTo(b.AddedOrder);
+                    });
                     break;
                 case Added:
                 default:
@@ -79,17 +105,96 @@ namespace Lumen
             return result;
         }
 
+        private static bool IsUnknownDuration(double duration)
+        {
+            return double.IsNaN(duration) || double.IsInfinity(duration) || duration <= 0;
+        }
+
         private static int CompareDuration(Track a, Track b, bool ascending)
         {
-            // 未知时长排在最后，不要混在中间
-            bool aUnknown = a.Duration <= 0;
-            bool bUnknown = b.Duration <= 0;
+            // 未知时长（<= 0 / NaN / Infinity）排在最后，不混在中间
+            bool aUnknown = IsUnknownDuration(a.Duration);
+            bool bUnknown = IsUnknownDuration(b.Duration);
             if (aUnknown && bUnknown) return a.AddedOrder.CompareTo(b.AddedOrder);
             if (aUnknown) return 1;
             if (bUnknown) return -1;
 
             int c = a.Duration.CompareTo(b.Duration);
-            return ascending ? c : -c;
+            if (c != 0) return ascending ? c : -c;
+            return a.AddedOrder.CompareTo(b.AddedOrder);
+        }
+
+        /// <summary>
+        /// 自然排序比较器：连续数字段按数值大小比较（如 "Track 2" &lt; "Track 10"），
+        /// 非数字段按当前文化忽略大小写比较。
+        /// </summary>
+        private static int CompareNatural(string a, string b)
+        {
+            if (ReferenceEquals(a, b)) return 0;
+            a = a ?? string.Empty;
+            b = b ?? string.Empty;
+
+            int ia = 0, ib = 0;
+            var compareInfo = CultureInfo.CurrentCulture.CompareInfo;
+
+            while (ia < a.Length && ib < b.Length)
+            {
+                bool aDigit = IsAsciiDigit(a[ia]);
+                bool bDigit = IsAsciiDigit(b[ib]);
+
+                if (aDigit && bDigit)
+                {
+                    int startA = ia;
+                    while (ia < a.Length && IsAsciiDigit(a[ia])) ia++;
+                    int startB = ib;
+                    while (ib < b.Length && IsAsciiDigit(b[ib])) ib++;
+
+                    // 跳过前导零
+                    int nzA = startA;
+                    while (nzA < ia && a[nzA] == '0') nzA++;
+                    int nzB = startB;
+                    while (nzB < ib && b[nzB] == '0') nzB++;
+
+                    int sigLenA = ia - nzA;
+                    int sigLenB = ib - nzB;
+                    if (sigLenA != sigLenB)
+                        return sigLenA.CompareTo(sigLenB);
+
+                    for (int k = 0; k < sigLenA; k++)
+                    {
+                        if (a[nzA + k] != b[nzB + k])
+                            return a[nzA + k].CompareTo(b[nzB + k]);
+                    }
+
+                    // 数值相等时，按原始数字段长度区分（如 "01" vs "1"），保持严格弱序
+                    int rawLenA = ia - startA;
+                    int rawLenB = ib - startB;
+                    if (rawLenA != rawLenB)
+                        return rawLenA.CompareTo(rawLenB);
+                }
+                else
+                {
+                    int startA = ia;
+                    while (ia < a.Length && !IsAsciiDigit(a[ia])) ia++;
+                    int startB = ib;
+                    while (ib < b.Length && !IsAsciiDigit(b[ib])) ib++;
+
+                    int cmp = compareInfo.Compare(
+                        a, startA, ia - startA,
+                        b, startB, ib - startB,
+                        CompareOptions.IgnoreCase);
+                    if (cmp != 0) return cmp;
+                }
+            }
+
+            if (ia < a.Length) return 1;
+            if (ib < b.Length) return -1;
+            return 0;
+        }
+
+        private static bool IsAsciiDigit(char c)
+        {
+            return c >= '0' && c <= '9';
         }
 
         public static string DisplayName(string mode)

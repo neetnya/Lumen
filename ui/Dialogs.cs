@@ -1,8 +1,9 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Input;
 using System.Windows.Media;
 
 namespace Lumen.UI
@@ -41,7 +42,7 @@ namespace Lumen.UI
         /// </summary>
         public static bool? Choose(Window owner, string title, string message, string primaryText, string secondaryText)
         {
-            var window = CreateWindow(owner, title, 400, 200);
+            var window = CreateWindow(owner, title, 400, 180);
             bool? result = null;
 
             var root = new Grid { Margin = new Thickness(22, 20, 22, 16) };
@@ -63,13 +64,18 @@ namespace Lumen.UI
             Grid.SetRow(head, 0);
             root.Children.Add(head);
 
-            var body = new TextBlock
+            var body = new ScrollViewer
+            {
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                Margin = new Thickness(0, 12, 0, 0),
+                MaxHeight = 260
+            };
+            body.Content = new TextBlock
             {
                 Text = message ?? "",
                 TextWrapping = TextWrapping.Wrap,
                 Foreground = Theme.Brush("Brush.TextDim"),
-                LineHeight = 20,
-                Margin = new Thickness(0, 12, 0, 0)
+                LineHeight = 20
             };
             Grid.SetRow(body, 1);
             root.Children.Add(body);
@@ -87,6 +93,7 @@ namespace Lumen.UI
                 window.DialogResult = true;
             };
             var primary = MakeButton(primaryText, true);
+            primary.IsDefault = true;
             primary.Click += delegate
             {
                 result = true;
@@ -97,6 +104,17 @@ namespace Lumen.UI
             Grid.SetRow(buttons, 2);
             root.Children.Add(buttons);
 
+            // Esc 取消返回 null（不误触次按钮）
+            window.PreviewKeyDown += delegate (object s, KeyEventArgs e)
+            {
+                if (e.Key == Key.Escape)
+                {
+                    result = null;
+                    window.DialogResult = false;
+                    e.Handled = true;
+                }
+            };
+
             window.Loaded += delegate { primary.Focus(); };
             WrapContent(window, root);
             window.ShowDialog();
@@ -106,17 +124,29 @@ namespace Lumen.UI
         /// <summary>文本输入框（新建/重命名分组用），取消返回 null。</summary>
         public static string Prompt(Window owner, string title, string message, string initial)
         {
-            var window = CreateWindow(owner, title, 380, 210);
+            var window = CreateWindow(owner, title, 380, 170);
             string result = null;
 
-            var root = new StackPanel { Margin = new Thickness(22, 18, 22, 16) };
-            root.Children.Add(new TextBlock
+            var root = new Grid { Margin = new Thickness(22, 18, 22, 16) };
+            root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+            root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+
+            var promptScroll = new ScrollViewer
             {
-                Text = message,
+                VerticalScrollBarVisibility = ScrollBarVisibility.Auto,
+                MaxHeight = 160,
+                Margin = new Thickness(0, 0, 0, 10)
+            };
+            promptScroll.Content = new TextBlock
+            {
+                Text = message ?? "",
                 Foreground = Theme.Brush("Brush.TextDim"),
                 TextWrapping = TextWrapping.Wrap,
-                Margin = new Thickness(0, 0, 0, 10)
-            });
+                LineHeight = 20
+            };
+            Grid.SetRow(promptScroll, 0);
+            root.Children.Add(promptScroll);
 
             var box = new TextBox
             {
@@ -130,6 +160,7 @@ namespace Lumen.UI
                 BorderThickness = new Thickness(0),
                 FontSize = 13
             };
+            Grid.SetRow(box, 1);
             root.Children.Add(box);
 
             var buttons = new StackPanel
@@ -139,11 +170,14 @@ namespace Lumen.UI
                 Margin = new Thickness(0, 18, 0, 0)
             };
             var cancel = MakeButton("取消", false);
+            cancel.IsCancel = true;
             var ok = MakeButton("确定", true);
+            ok.IsDefault = true;
             cancel.Click += delegate { window.DialogResult = false; };
             ok.Click += delegate { result = box.Text; window.DialogResult = true; };
             buttons.Children.Add(cancel);
             buttons.Children.Add(ok);
+            Grid.SetRow(buttons, 2);
             root.Children.Add(buttons);
 
             window.Loaded += delegate
@@ -166,7 +200,7 @@ namespace Lumen.UI
 
         private static bool Show(Window owner, string title, string message, Kind kind, bool confirm, string okText = "确定")
         {
-            var window = CreateWindow(owner, title, 400, confirm ? 200 : 190);
+            var window = CreateWindow(owner, title, 400, confirm ? 180 : 170);
             bool accepted = false;
 
             var root = new Grid { Margin = new Thickness(22, 20, 22, 16) };
@@ -214,10 +248,13 @@ namespace Lumen.UI
             if (confirm)
             {
                 var cancel = MakeButton("取消", false);
+                cancel.IsCancel = true;
                 cancel.Click += delegate { window.DialogResult = false; };
                 buttons.Children.Add(cancel);
             }
             var ok = MakeButton(confirm ? okText : "知道了", true);
+            ok.IsDefault = true;
+            if (!confirm) ok.IsCancel = true;
             ok.Click += delegate { accepted = true; window.DialogResult = true; };
             buttons.Children.Add(ok);
             Grid.SetRow(buttons, 2);
@@ -317,8 +354,10 @@ namespace Lumen.UI
             return template;
         }
 
-        private static Window CreateWindow(Window owner, string title, double width, double height)
+        private static Window CreateWindow(Window owner, string title, double width, double minHeight)
         {
+            bool validOwner = owner != null && owner.IsLoaded && owner.IsVisible;
+
             var window = new Window
             {
                 WindowStyle = WindowStyle.None,
@@ -327,16 +366,19 @@ namespace Lumen.UI
                 ResizeMode = ResizeMode.NoResize,
                 ShowInTaskbar = false,
                 Width = width,
-                Height = height,
-                WindowStartupLocation = owner != null
+                MinHeight = minHeight,
+                MaxHeight = 460,
+                SizeToContent = SizeToContent.Height,
+                WindowStartupLocation = validOwner
                     ? WindowStartupLocation.CenterOwner
                     : WindowStartupLocation.CenterScreen,
-                Owner = owner,
                 Title = title,
                 FontFamily = new FontFamily("Microsoft YaHei UI, Microsoft YaHei, Segoe UI"),
                 FontSize = 12.5,
                 SnapsToDevicePixels = true
             };
+
+            if (validOwner) window.Owner = owner;
 
             // 用 Content 外套圆角边框；这里先留空，调用方设置 Content 前包一层
             var frame = new Border
@@ -345,6 +387,13 @@ namespace Lumen.UI
                 BorderBrush = Theme.Brush("Brush.WindowBorder"),
                 BorderThickness = new Thickness(1),
                 CornerRadius = new CornerRadius(8)
+            };
+            frame.MouseLeftButtonDown += delegate (object s, MouseButtonEventArgs e)
+            {
+                if (e.ChangedButton == MouseButton.Left)
+                {
+                    try { window.DragMove(); } catch { }
+                }
             };
             window.Tag = frame;
 

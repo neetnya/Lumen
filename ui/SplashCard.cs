@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Media;
@@ -13,7 +13,7 @@ namespace Lumen.UI
     public sealed class SplashCard : Window
     {
         private readonly TextBlock _status;
-        private bool _closed;
+        private volatile bool _closed;
 
         public SplashCard()
         {
@@ -23,8 +23,9 @@ namespace Lumen.UI
             ResizeMode = ResizeMode.NoResize;
             ShowInTaskbar = false;
             Topmost = true;
-            Width = 330;
-            Height = 116;
+            // 外层留 24px 阴影边距，保证 22px 模糊半径的阴影不被窗口边界硬切
+            Width = 378;
+            Height = 164;
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
             FontFamily = new FontFamily("Microsoft YaHei UI, Microsoft YaHei, Segoe UI");
             FontSize = 12.5;
@@ -32,6 +33,7 @@ namespace Lumen.UI
 
             var frame = new Border
             {
+                Margin = new Thickness(24),
                 Background = Theme.Brush("Brush.Raised"),
                 BorderBrush = Theme.Brush("Brush.WindowBorder"),
                 BorderThickness = new Thickness(1),
@@ -78,6 +80,7 @@ namespace Lumen.UI
             Opacity = 0;
             Loaded += delegate
             {
+                if (_closed) return;
                 var fade = new DoubleAnimation(0, 1, TimeSpan.FromMilliseconds(160));
                 BeginAnimation(OpacityProperty, fade);
             };
@@ -147,13 +150,14 @@ namespace Lumen.UI
             {
                 Dispatcher.BeginInvoke(new Action(delegate
                 {
+                    if (_closed) return;
                     try { _status.Text = text; } catch { }
                 }));
             }
             catch { }
         }
 
-        /// <summary>收起卡片（淡出后关闭）。</summary>
+        /// <summary>收起卡片（从当前透明度淡出后关闭）。</summary>
         public void Dismiss()
         {
             if (_closed) return;
@@ -165,7 +169,14 @@ namespace Lumen.UI
                 {
                     try
                     {
-                        var fade = new DoubleAnimation(1, 0, TimeSpan.FromMilliseconds(140));
+                        IsHitTestVisible = false;
+                        double currentOpacity = Opacity;
+                        if (currentOpacity <= 0.01)
+                        {
+                            Close();
+                            return;
+                        }
+                        var fade = new DoubleAnimation(currentOpacity, 0, TimeSpan.FromMilliseconds(140));
                         fade.Completed += delegate { try { Close(); } catch { } };
                         BeginAnimation(OpacityProperty, fade);
                     }

@@ -20,13 +20,20 @@ namespace Lumen.UI
         private Brush _outline = Brushes.Black;
         private double _outlineThickness = 2;
 
+        private Typeface _typeface;
+        private Geometry _cachedGeometry;
+        private double _cachedGeometryPpd;
+        private Pen _cachedPen;
+
         public string Text
         {
             get { return _text; }
             set
             {
-                if (string.Equals(_text, value, StringComparison.Ordinal)) return;
-                _text = value ?? string.Empty;
+                var normalized = value ?? string.Empty;
+                if (string.Equals(_text, normalized, StringComparison.Ordinal)) return;
+                _text = normalized;
+                _cachedGeometry = null;
                 InvalidateMeasure();
                 InvalidateVisual();
             }
@@ -35,40 +42,82 @@ namespace Lumen.UI
         public FontFamily FontFamily
         {
             get { return _fontFamily; }
-            set { _fontFamily = value; InvalidateMeasure(); InvalidateVisual(); }
+            set
+            {
+                var next = value ?? new FontFamily("Microsoft YaHei");
+                if (Equals(_fontFamily, next)) return;
+                _fontFamily = next;
+                _typeface = null;
+                _cachedGeometry = null;
+                InvalidateMeasure();
+                InvalidateVisual();
+            }
         }
 
         public double FontSize
         {
             get { return _fontSize; }
-            set { _fontSize = value; InvalidateMeasure(); InvalidateVisual(); }
+            set
+            {
+                if (_fontSize == value) return;
+                _fontSize = value;
+                _cachedGeometry = null;
+                InvalidateMeasure();
+                InvalidateVisual();
+            }
         }
 
         public FontWeight FontWeight
         {
             get { return _fontWeight; }
-            set { _fontWeight = value; InvalidateMeasure(); InvalidateVisual(); }
+            set
+            {
+                if (_fontWeight == value) return;
+                _fontWeight = value;
+                _typeface = null;
+                _cachedGeometry = null;
+                InvalidateMeasure();
+                InvalidateVisual();
+            }
         }
 
         public Brush Foreground
         {
             get { return _foreground; }
-            set { _foreground = value; InvalidateVisual(); }
+            set
+            {
+                if (Equals(_foreground, value)) return;
+                _foreground = value;
+                InvalidateVisual();
+            }
         }
 
         public Brush Outline
         {
             get { return _outline; }
-            set { _outline = value; InvalidateVisual(); }
+            set
+            {
+                if (Equals(_outline, value)) return;
+                _outline = value;
+                _cachedPen = null;
+                InvalidateVisual();
+            }
         }
 
         public double OutlineThickness
         {
             get { return _outlineThickness; }
-            set { _outlineThickness = value; InvalidateVisual(); }
+            set
+            {
+                double next = value < 0 ? 0 : value;
+                if (_outlineThickness == next) return;
+                _outlineThickness = next;
+                _cachedPen = null;
+                _cachedGeometry = null;
+                InvalidateMeasure();
+                InvalidateVisual();
+            }
         }
-
-        private Typeface _typeface;
 
         private Typeface CurrentTypeface
         {
@@ -80,27 +129,76 @@ namespace Lumen.UI
             }
         }
 
-        private FormattedText BuildFormattedText()
+        private double GetPixelsPerDip()
         {
-            double ppd = 1.0;
+            var dpi = VisualTreeHelper.GetDpi(this);
+            if (dpi.PixelsPerDip > 0) return dpi.PixelsPerDip;
+
             var source = PresentationSource.FromVisual(this);
             if (source != null && source.CompositionTarget != null)
-                ppd = source.CompositionTarget.TransformToDevice.M11;
+                return source.CompositionTarget.TransformToDevice.M11;
 
+            return 1.0;
+        }
+
+        private FormattedText BuildFormattedText(double ppd)
+        {
             return new FormattedText(
                 _text,
                 CultureInfo.CurrentUICulture,
                 FlowDirection.LeftToRight,
                 CurrentTypeface,
                 _fontSize,
-                _foreground,
+                _foreground ?? Brushes.White,
                 ppd);
+        }
+
+        private Geometry EnsureGeometry()
+        {
+            double ppd = GetPixelsPerDip();
+            if (_cachedGeometry != null && Math.Abs(_cachedGeometryPpd - ppd) < 1e-6)
+                return _cachedGeometry;
+
+            var ft = BuildFormattedText(ppd);
+            double half = _outlineThickness / 2.0;
+            var geometry = ft.BuildGeometry(new Point(half, half));
+            if (geometry != null && geometry.CanFreeze)
+                geometry.Freeze();
+
+            _cachedGeometry = geometry;
+            _cachedGeometryPpd = ppd;
+            return geometry;
+        }
+
+        private Pen EnsurePen()
+        {
+            if (_cachedPen != null) return _cachedPen;
+            if (_outline == null || _outlineThickness <= 0) return null;
+
+            var pen = new Pen(_outline, _outlineThickness)
+            {
+                LineJoin = PenLineJoin.Round
+            };
+            if (pen.CanFreeze) pen.Freeze();
+
+            _cachedPen = pen;
+            return pen;
+        }
+
+        protected override void OnDpiChanged(DpiScale oldDpi, DpiScale newDpi)
+        {
+            base.OnDpiChanged(oldDpi, newDpi);
+            _cachedGeometry = null;
+            InvalidateMeasure();
+            InvalidateVisual();
         }
 
         protected override Size MeasureOverride(Size availableSize)
         {
-            var ft = BuildFormattedText();
-            return new Size(ft.Width, ft.Height);
+            var ft = BuildFormattedText(GetPixelsPerDip());
+            return new Size(
+                ft.WidthIncludingTrailingWhitespace + _outlineThickness,
+                ft.Height + _outlineThickness);
         }
 
         protected override void OnRender(DrawingContext dc)
@@ -108,15 +206,13 @@ namespace Lumen.UI
             base.OnRender(dc);
             if (string.IsNullOrEmpty(_text)) return;
 
-            var geometry = BuildFormattedText().BuildGeometry(new Point(0, 0));
+            var geometry = EnsureGeometry();
+            if (geometry == null) return;
 
             // 先描边（轮廓），再填充（字形），描边会被字形盖住内侧一半，
             // 只剩外侧一半成为均匀的「描边」。
-            var pen = new Pen(_outline, _outlineThickness)
-            {
-                LineJoin = PenLineJoin.Round
-            };
-            dc.DrawGeometry(null, pen, geometry);
+            var pen = EnsurePen();
+            if (pen != null) dc.DrawGeometry(null, pen, geometry);
             dc.DrawGeometry(_foreground, null, geometry);
         }
     }

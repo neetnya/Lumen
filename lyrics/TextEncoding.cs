@@ -1,18 +1,21 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Text;
 
 namespace Lumen.Lyrics
 {
     /// <summary>
-    /// 文本编码识别：BOM → UTF-8 严格校验 → GBK 回退。
+    /// 文本编码识别：BOM → UTF-16 LE/BE → UTF-8 严格校验 → GBK 回退。
     /// 对应 README 的「UTF-8 / GBK / UTF-16 自动识别」。
     /// </summary>
     public static class TextEncoding
     {
         private static readonly object ProviderGate = new object();
-        private static bool _providerReady;
+        private static volatile bool _providerReady;
         private static Encoding _gbk;
+
+        private static readonly UTF8Encoding Utf8NoBom = new UTF8Encoding(false, throwOnInvalidBytes: false);
+        private static readonly UTF8Encoding StrictUtf8 = new UTF8Encoding(false, throwOnInvalidBytes: true);
 
         /// <summary>
         /// 注册 CodePagesEncodingProvider（提供 GBK/936 等代码页）。
@@ -28,7 +31,6 @@ namespace Lumen.Lyrics
             lock (ProviderGate)
             {
                 if (_providerReady) return;
-                _providerReady = true;
                 try
                 {
                     var type = Type.GetType(
@@ -56,6 +58,10 @@ namespace Lumen.Lyrics
                 {
                     Log.Warn("注册代码页提供程序失败: " + ex.Message);
                 }
+                finally
+                {
+                    _providerReady = true;
+                }
             }
         }
 
@@ -73,7 +79,7 @@ namespace Lumen.Lyrics
         public static string DecodeGbk(byte[] bytes)
         {
             var gbk = Gbk;
-            if (gbk == null) return null;
+            if (gbk == null || bytes == null) return null;
             try { return gbk.GetString(bytes); }
             catch { return null; }
         }
@@ -91,19 +97,20 @@ namespace Lumen.Lyrics
 
             // 1) BOM
             if (bytes.Length >= 3 && bytes[0] == 0xEF && bytes[1] == 0xBB && bytes[2] == 0xBF)
-                return new UTF8Encoding(false).GetString(bytes, 3, bytes.Length - 3);
+                return Utf8NoBom.GetString(bytes, 3, bytes.Length - 3);
             if (bytes.Length >= 2 && bytes[0] == 0xFF && bytes[1] == 0xFE)
                 return Encoding.Unicode.GetString(bytes, 2, bytes.Length - 2);
             if (bytes.Length >= 2 && bytes[0] == 0xFE && bytes[1] == 0xFF)
                 return Encoding.BigEndianUnicode.GetString(bytes, 2, bytes.Length - 2);
 
-            // 2) 猜 UTF-16（无 BOM）：大量 0x00 在奇数位
-            if (LooksLikeUtf16(bytes))
-                return Encoding.Unicode.GetString(bytes);
+            // 2) 猜 UTF-16（无 BOM）：准确区分 LE 与 BE，并结合换行符特征支持纯中文 UTF-16
+            var utf16 = LooksLikeUtf16(bytes);
+            if (utf16 != null)
+                return utf16.GetString(bytes);
 
             // 3) UTF-8 严格校验：能解码就是 UTF-8
             if (IsValidUtf8(bytes))
-                return new UTF8Encoding(false).GetString(bytes);
+                return Utf8NoBom.GetString(bytes);
 
             // 4) 回退 GBK（中文 Windows 上最常见的歌词编码）
             var gbk = DecodeGbk(bytes);
@@ -116,44 +123,60 @@ namespace Lumen.Lyrics
         /// <summary>严格 UTF-8 校验（拒绝非法续字节 / 超长编码 / 代理区）。</summary>
         public static bool IsValidUtf8(byte[] bytes)
         {
-            int i = 0;
-            int nonAscii = 0;
-            while (i < bytes.Length)
+            if (bytes == null) return false;
+            if (bytes.Length == 0) return true;
+            try
             {
-                byte b = bytes[i];
-                if (b < 0x80) { i++; continue; }
-
-                int extra;
-                if ((b & 0xE0) == 0xC0) extra = 1;
-                else if ((b & 0xF0) == 0xE0) extra = 2;
-                else if ((b & 0xF8) == 0xF0) extra = 3;
-                else return false;
-
-                if (i + extra >= bytes.Length) return false;
-                for (int k = 1; k <= extra; k++)
-                {
-                    if ((bytes[i + k] & 0xC0) != 0x80) return false;
-                }
-                nonAscii++;
-                i += extra + 1;
+                StrictUtf8.GetCharCount(bytes);
+                return true;
             }
-            // 纯 ASCII 时交给调用方按 GBK 处理也无所谓，这里算合法
-            return true;
+            catch (DecoderFallbackException)
+            {
+                return false;
+            }
         }
 
-        private static bool LooksLikeUtf16(byte[] bytes)
+        /// <summary>
+        /// 探测无 BOM 的 UTF-16 字节流，返回 Encoding.Unicode (LE) 或 Encoding.BigEndianUnicode (BE)；
+        /// 无法确认时返回 null。
+        /// </summary>
+        private static Encoding LooksLikeUtf16(byte[] bytes)
         {
-            if (bytes.Length < 4 || bytes.Length % 2 != 0) return false;
+            if (bytes == null || bytes.Length < 4 || bytes.Length % 2 != 0) return null;
+
             int zerosOdd = 0, zerosEven = 0;
-            int limit = Math.Min(bytes.Length, 512);
+            int leNewlines = 0, beNewlines = 0;
+            int limit = Math.Min(bytes.Length, 1024);
+            if (limit % 2 != 0) limit--;
+
             for (int i = 0; i + 1 < limit; i += 2)
             {
-                if (bytes[i] == 0) zerosEven++;
-                if (bytes[i + 1] == 0) zerosOdd++;
+                byte b0 = bytes[i];
+                byte b1 = bytes[i + 1];
+
+                if (b0 == 0) zerosEven++;
+                if (b1 == 0) zerosOdd++;
+
+                if ((b0 == 0x0A || b0 == 0x0D) && b1 == 0x00) leNewlines++;
+                if (b0 == 0x00 && (b1 == 0x0A || b1 == 0x0D)) beNewlines++;
             }
+
             int pairs = limit / 2;
-            if (pairs == 0) return false;
-            return zerosOdd > pairs * 0.6 || zerosEven > pairs * 0.6;
+            if (pairs == 0) return null;
+
+            // ASCII 占比较高时，零字节位置明确区分 LE / BE
+            if (zerosOdd > pairs * 0.3 && zerosOdd > zerosEven * 2)
+                return Encoding.Unicode;
+            if (zerosEven > pairs * 0.3 && zerosEven > zerosOdd * 2)
+                return Encoding.BigEndianUnicode;
+
+            // 纯中文等多字节 UTF-16：依靠 UTF-16 换行符特征 (0x0A 0x00 / 0x00 0x0A) 辅助识别
+            if (leNewlines >= 1 && beNewlines == 0 && zerosEven == 0)
+                return Encoding.Unicode;
+            if (beNewlines >= 1 && leNewlines == 0 && zerosOdd == 0)
+                return Encoding.BigEndianUnicode;
+
+            return null;
         }
 
         /// <summary>去掉 UTF-8 BOM 字符。</summary>

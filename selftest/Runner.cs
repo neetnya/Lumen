@@ -2,16 +2,16 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Text;
+using System.Text.Json;
 using System.Windows;
-using System.Windows.Media;
 using System.Windows.Threading;
 
 namespace Lumen.SelfTest
 {
     /// <summary>
     /// 内置自检（对应 README 的 --selftest）：
-    /// 自己造一个 WAV + LRC，验证「界面能建、音频能解码、歌词能同步、穿透能生效」，
-    /// 结果写到配置目录的 selftest-result.json。
+    /// 在独立临时目录造一个 WAV + LRC，验证「界面能建、音频能解码、歌词能同步、穿透能生效」，
+    /// 不污染用户真实 library.json，结果写到配置目录的 selftest-result.json。
     /// </summary>
     public static class Runner
     {
@@ -27,9 +27,13 @@ namespace Lumen.SelfTest
                 Log.Info((ok ? "[自检 PASS] " : "[自检 FAIL] ") + name + (detail != null ? " :: " + detail : ""));
             }
 
+            var tempDir = Path.Combine(Path.GetTempPath(), "LumenSelfTest_" + Guid.NewGuid().ToString("N"));
+            var tempConfigPath = Path.Combine(tempDir, "library.json");
+
             try
             {
                 Log.Info("=== 内置自检开始 (" + seconds + " 秒) ===");
+                Directory.CreateDirectory(tempDir);
 
                 // ---- 1. 数据目录可写 ----
                 try
@@ -54,11 +58,11 @@ namespace Lumen.SelfTest
                 });
                 Report(lyricsFail == 0, "歌词格式解析", lyricsPass + " 项通过 / " + lyricsFail + " 项失败");
 
-                // ---- 3. 造一个 WAV + LRC ----
+                // ---- 3. 在独立临时目录造一个 WAV + LRC ----
                 string wavPath = null, lrcPath = null;
                 try
                 {
-                    var dir = Path.Combine(Paths.DataDir, "selftest");
+                    var dir = Path.Combine(tempDir, "selftest");
                     Directory.CreateDirectory(dir);
                     wavPath = Path.Combine(dir, "selftest-tone.wav");
                     lrcPath = Path.Combine(dir, "selftest-tone.lrc");
@@ -177,9 +181,8 @@ namespace Lumen.SelfTest
                         desktop.Show();
                         desktop.UpdateLayout();
 
-                        double expected = 0; // 稍后校验
                         var area = Native.Win32.GetWorkArea(IntPtr.Zero);
-                        expected = Math.Max(320, (area.right - area.left) * 0.60);
+                        double expected = Math.Max(320, (area.right - area.left) * 0.60);
 
                         bool widthOk = Math.Abs(desktop.Width - expected) < 2.0;
 
@@ -211,15 +214,16 @@ namespace Lumen.SelfTest
                     Report(false, "桌面歌词：宽度 60% + 穿透生效", ex.Message);
                 }
 
-                // ---- 8. 配置能存能读 ----
+                // ---- 8. 配置能存能读（使用独立临时配置文件，不污染用户数据） ----
                 try
                 {
-                    var config = Config.Load();
+                    var config = Config.Load(tempConfigPath);
                     var group = config.EnsureGroup();
                     group.LastPositionSeconds = 12.5;
                     config.VolumePercent = 55;
-                    bool saved = config.Save();
-                    var reloaded = Config.Load();
+                    config.Save(tempConfigPath);
+                    bool saved = File.Exists(tempConfigPath);
+                    var reloaded = Config.Load(tempConfigPath);
                     bool roundTrip = reloaded.VolumePercent == 55 &&
                                      reloaded.CurrentGroup != null &&
                                      Math.Abs(reloaded.CurrentGroup.LastPositionSeconds - 12.5) < 0.001;
@@ -236,7 +240,7 @@ namespace Lumen.SelfTest
                     var first = new SingleInstance();
                     bool acquired = first.TryAcquire();
                     var second = new SingleInstance();
-                    bool secondAcquired = second.TryAcquire();
+                    second.TryAcquire();
 
                     // 同一进程内命名互斥体是可重入的，所以这里主要验证不抛异常且首个成功
                     Report(acquired, "单实例互斥体可创建");
@@ -297,7 +301,7 @@ namespace Lumen.SelfTest
                 // ---- 13. 分组独立进度记忆（切组 + 重启的核心数据） ----
                 try
                 {
-                    var config = Config.Load();
+                    var config = Config.Load(tempConfigPath);
                     // 造两个分组，各记一个进度
                     while (config.Groups.Count < 2) config.Groups.Add(new Models.Group { Name = "自检组" + config.Groups.Count });
                     var groupA = config.Groups[0];
@@ -308,9 +312,9 @@ namespace Lumen.SelfTest
                     groupB.LastTrackPath = @"C:\music\b.mp3";
                     groupB.LastPositionSeconds = 42.5;
                     config.CurrentGroupId = groupB.Id;
-                    config.Save();
+                    config.Save(tempConfigPath);
 
-                    var reloaded = Config.Load();
+                    var reloaded = Config.Load(tempConfigPath);
                     var reloadedA = reloaded.Groups[0];
                     var reloadedB = reloaded.Groups[1];
 
@@ -330,12 +334,12 @@ namespace Lumen.SelfTest
                 // ---- 14. 打乱顺序持久化 ----
                 try
                 {
-                    var config = Config.Load();
+                    var config = Config.Load(tempConfigPath);
                     var group = config.EnsureGroup();
                     group.ShuffledOrder = new List<string> { "c.mp3", "a.mp3", "b.mp3" };
-                    config.Save();
+                    config.Save(tempConfigPath);
 
-                    var reloaded = Config.Load();
+                    var reloaded = Config.Load(tempConfigPath);
                     var order = reloaded.CurrentGroup != null ? reloaded.CurrentGroup.ShuffledOrder : null;
                     bool ok = order != null && order.Count == 3 &&
                               order[0] == "c.mp3" && order[1] == "a.mp3" && order[2] == "b.mp3";
@@ -350,15 +354,15 @@ namespace Lumen.SelfTest
                 try
                 {
                     var group = new Models.Group { Name = "排序自检" };
-                    group.Tracks.Add(new Models.Track { Title = "B歌", Path = "b.mp3", Duration = 200, AddedOrder = 2 });
-                    group.Tracks.Add(new Models.Track { Title = "A歌", Path = "a.mp3", Duration = 100, AddedOrder = 1 });
-                    group.Tracks.Add(new Models.Track { Title = "C歌", Path = "c.mp3", Duration = 300, AddedOrder = 3 });
+                    group.Tracks.Add(new Models.Track { Title = "Track 10", Path = "b.mp3", Duration = 200, AddedOrder = 2 });
+                    group.Tracks.Add(new Models.Track { Title = "Track 2", Path = "a.mp3", Duration = 100, AddedOrder = 1 });
+                    group.Tracks.Add(new Models.Track { Title = "Track 20", Path = "c.mp3", Duration = 300, AddedOrder = 3 });
 
                     var byTitle = TrackSorter.Sort(group, TrackSorter.Title);
                     var byDuration = TrackSorter.Sort(group, TrackSorter.Duration);
                     var byAdded = TrackSorter.Sort(group, TrackSorter.Added);
 
-                    bool ok = byTitle[0].Title == "A歌" && byTitle[2].Title == "C歌" &&
+                    bool ok = byTitle[0].Title == "Track 2" && byTitle[1].Title == "Track 10" && byTitle[2].Title == "Track 20" &&
                               byDuration[0].Duration == 100 && byDuration[2].Duration == 300 &&
                               byAdded[0].AddedOrder == 1 && byAdded[2].AddedOrder == 3;
 
@@ -367,7 +371,7 @@ namespace Lumen.SelfTest
                     var shuffled = TrackSorter.Sort(group, TrackSorter.Title);
                     bool shuffleWins = shuffled[0].Path == "c.mp3" && shuffled[2].Path == "b.mp3";
 
-                    Report(ok && shuffleWins, "排序（标题/时长/最近添加）与打乱优先级");
+                    Report(ok && shuffleWins, "排序（自然标题/时长/最近添加）与打乱优先级");
                 }
                 catch (Exception ex)
                 {
@@ -399,13 +403,38 @@ namespace Lumen.SelfTest
                     Report(false, "搜索匹配", ex.Message);
                 }
 
+                // ---- 17. 文件名推导元数据 ----
+                try
+                {
+                    var dir = Path.Combine(tempDir, "selftest");
+                    Directory.CreateDirectory(dir);
+                    var fake = Path.Combine(dir, "周杰伦 - 夜曲.mp3");
+                    if (!File.Exists(fake)) File.WriteAllBytes(fake, new byte[] { 0 });
+
+                    var track = Models.Track.FromFile(fake, 1);
+                    bool ok = track.Artist == "周杰伦" && track.Title == "夜曲" &&
+                              track.Format == "mp3" && track.Album == "selftest";
+
+                    // "01 - intro" 里确实含 " - "，按艺术家/标题切分是预期行为；
+                    // 真正不该被误切的是不带空格的分隔符，例如 "01-02 前奏" 或纯数字范围 "2024–2025 回顾"
+                    var plain = Models.Track.FromFile(Path.Combine(dir, "01-02 前奏.mp3"), 2);
+                    var yearRange = Models.Track.FromFile(Path.Combine(dir, "2024–2025 回顾.mp3"), 3);
+                    bool noFalseSplit = plain.Title == "01-02 前奏" && plain.Artist == "" &&
+                                        yearRange.Title == "2024–2025 回顾" && yearRange.Artist == "";
+
+                    Report(ok && noFalseSplit, "从文件名推导艺术家/标题/专辑",
+                        "'" + track.Artist + "' / '" + track.Title + "'，无空格/数字范围不误切=" + noFalseSplit);
+                }
+                catch (Exception ex)
+                {
+                    Report(false, "从文件名推导元数据", ex.Message);
+                }
+
                 // ---- 18. 自绘对话框能真的弹出来 ----
                 // 守住两个真实发生过的 bug（都会让对话框弹不出来，
                 // 导致「导入文件夹 / 新建分组 / 重命名分组 / 删除分组」全部失效）：
                 //   a) 先 window.Content = root 再 frame.Child = root → 「元素已有父级」
                 //   b) Setter(dp, value, "") 的空子节点标识符 → 「子节点标识符不能是空字符串」
-                // 关键在于必须构造**真实的 Dialogs 按钮**并把它挂进可视化树 ——
-                // 模板只有在 Seal / 套用时才会暴露这两个问题。
                 try
                 {
                     var ok = RunOnUiThread(() =>
@@ -443,10 +472,6 @@ namespace Lumen.SelfTest
                         window.Show();
                         window.UpdateLayout();
 
-                        // 模板套用成功即可 —— 空 Target 的 Setter 会在 Seal/套用时
-                        // 直接抛异常，能走到这里就说明没有那个问题。
-                        // （注意：TargetName 为空本身是合法的，表示作用于模板根，
-                        //   所以不能拿「TargetName 必须非空」当判据。）
                         bool applied = okButton.Template != null && cancelButton.Template != null;
 
                         window.Close();
@@ -457,7 +482,6 @@ namespace Lumen.SelfTest
                 }
                 catch (Exception ex)
                 {
-                    // 反射调用会把真实异常包在 TargetInvocationException 里，拆出来才看得清
                     var inner = ex;
                     while (inner is System.Reflection.TargetInvocationException && inner.InnerException != null)
                         inner = inner.InnerException;
@@ -466,46 +490,39 @@ namespace Lumen.SelfTest
                         inner.GetType().Name + ": " + inner.Message);
                 }
 
-                // ---- 19. 桌面歌词：默认位置在屏幕上方 ----
+                // ---- 19. 桌面歌词：默认位置在屏幕上方（真实实例化校验） ----
                 try
                 {
-                    var area = Native.Win32.GetWorkArea(IntPtr.Zero);
-                    double barHeight = 92;
-                    double top = area.top + 60;   // DefaultTopGap = 60
+                    double actualTop = double.NaN;
+                    int areaTop = 0;
 
-                    bool nearTop = top >= area.top && top < area.top + 200;
-                    bool visible = top + barHeight > area.top;
+                    var ok = RunOnUiThread(() =>
+                    {
+                        var desktop = new UI.DesktopLyricsWindow
+                        {
+                            ShowActivated = false
+                        };
+                        desktop.Show();
+                        desktop.UpdateLayout();
 
-                    Report(nearTop && visible, "桌面歌词默认位置在屏幕上方",
-                        string.Format("top={0:0} 工作区顶={1}", top, area.top));
+                        var handle = new System.Windows.Interop.WindowInteropHelper(desktop).Handle;
+                        var area = Native.Win32.GetWorkArea(handle);
+                        areaTop = area.top;
+                        actualTop = desktop.Top;
+
+                        bool nearTop = actualTop >= area.top && actualTop < area.top + 200;
+                        bool visible = actualTop + desktop.Height > area.top;
+
+                        desktop.Close();
+                        return nearTop && visible;
+                    });
+
+                    Report(ok, "桌面歌词默认位置在屏幕上方",
+                        string.Format("top={0:0} 工作区顶={1}", actualTop, areaTop));
                 }
                 catch (Exception ex)
                 {
                     Report(false, "桌面歌词默认位置", ex.Message);
-                }
-                // ---- 17. 文件名推导元数据 ----
-                try
-                {
-                    var dir = Path.Combine(Paths.DataDir, "selftest");
-                    Directory.CreateDirectory(dir);
-                    var fake = Path.Combine(dir, "周杰伦 - 夜曲.mp3");
-                    if (!File.Exists(fake)) File.WriteAllBytes(fake, new byte[] { 0 });
-
-                    var track = Models.Track.FromFile(fake, 1);
-                    bool ok = track.Artist == "周杰伦" && track.Title == "夜曲" &&
-                              track.Format == "mp3" && track.Album == "selftest";
-
-                    // "01 - intro" 里确实含 " - "，按艺术家/标题切分是预期行为；
-                    // 真正不该被误切的是不带空格的分隔符，例如 "01-02 前奏"
-                    var plain = Models.Track.FromFile(Path.Combine(dir, "01-02 前奏.mp3"), 2);
-                    bool noFalseSplit = plain.Title == "01-02 前奏" && plain.Artist == "";
-
-                    Report(ok && noFalseSplit, "从文件名推导艺术家/标题/专辑",
-                        "'" + track.Artist + "' / '" + track.Title + "'，无空格分隔符不误切=" + noFalseSplit);
-                }
-                catch (Exception ex)
-                {
-                    Report(false, "从文件名推导元数据", ex.Message);
                 }
             }
             catch (Exception ex)
@@ -513,6 +530,17 @@ namespace Lumen.SelfTest
                 Log.Error("自检过程异常", ex);
                 results.Add(new Result { Name = "自检过程", Passed = false, Detail = ex.Message });
                 allPassed = false;
+            }
+            finally
+            {
+                try
+                {
+                    if (Directory.Exists(tempDir)) Directory.Delete(tempDir, true);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn("清理自检临时目录失败 " + tempDir + ": " + ex.Message);
+                }
             }
 
             // ---- 写结果 ----
@@ -524,15 +552,15 @@ namespace Lumen.SelfTest
             summary.AppendLine("  \"passed\": " + passed + ",");
             summary.AppendLine("  \"failed\": " + failed + ",");
             summary.AppendLine("  \"allPassed\": " + (allPassed ? "true" : "false") + ",");
-            summary.AppendLine("  \"timestamp\": \"" + DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss") + "\",");
+            summary.AppendLine("  \"timestamp\": " + Escape(DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss")) + ",");
             summary.AppendLine("  \"items\": [");
             for (int i = 0; i < results.Count; i++)
             {
                 var r = results[i];
-                summary.Append("    { \"name\": \"").Append(Escape(r.Name))
-                       .Append("\", \"passed\": ").Append(r.Passed ? "true" : "false");
+                summary.Append("    { \"name\": ").Append(Escape(r.Name))
+                       .Append(", \"passed\": ").Append(r.Passed ? "true" : "false");
                 if (!string.IsNullOrEmpty(r.Detail))
-                    summary.Append(", \"detail\": \"").Append(Escape(r.Detail)).Append("\"");
+                    summary.Append(", \"detail\": ").Append(Escape(r.Detail));
                 summary.Append(" }");
                 if (i < results.Count - 1) summary.Append(",");
                 summary.AppendLine();
@@ -573,9 +601,7 @@ namespace Lumen.SelfTest
 
         private static string Escape(string s)
         {
-            if (s == null) return "";
-            return s.Replace("\\", "\\\\").Replace("\"", "\\\"")
-                    .Replace("\r", " ").Replace("\n", " ");
+            return JsonSerializer.Serialize(s ?? string.Empty);
         }
 
         private sealed class Result

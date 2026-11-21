@@ -1,7 +1,6 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
-using System.Text;
 
 namespace Lumen.Models
 {
@@ -11,6 +10,8 @@ namespace Lumen.Models
     /// </summary>
     public sealed class Track
     {
+        private const double MaxDisplayDurationSeconds = 3599999.0; // ~999 小时上限，防止 TimeSpan 溢出
+
         public string Path;
 
         /// <summary>显示用标题（文件名去掉扩展名）。</summary>
@@ -41,7 +42,11 @@ namespace Lumen.Models
         {
             get
             {
-                if (Duration <= 0) return "--:--";
+                if (double.IsNaN(Duration) || double.IsInfinity(Duration) ||
+                    Duration <= 0 || Duration > MaxDisplayDurationSeconds)
+                {
+                    return "--:--";
+                }
                 var t = TimeSpan.FromSeconds(Duration);
                 return t.TotalHours >= 1
                     ? string.Format("{0}:{1:00}:{2:00}", (int)t.TotalHours, t.Minutes, t.Seconds)
@@ -54,12 +59,13 @@ namespace Lumen.Models
             get { return string.IsNullOrEmpty(Format) ? "" : Format.ToUpperInvariant(); }
         }
 
-        /// <summary>搜索匹配：标题 / 艺术家 / 专辑（空格分隔多关键词）。</summary>
+        /// <summary>搜索匹配：标题 / 艺术家 / 专辑（空格分隔多关键词，自动跳过空白词）。</summary>
         public bool Matches(IList<string> keywords)
         {
             if (keywords == null || keywords.Count == 0) return true;
             foreach (var kw in keywords)
             {
+                if (string.IsNullOrWhiteSpace(kw)) continue;
                 if (!Contains(Title, kw) && !Contains(Artist, kw) && !Contains(Album, kw))
                     return false;
             }
@@ -100,13 +106,17 @@ namespace Lumen.Models
             }
             catch { }
 
-            // 「艺术家 - 标题」/「艺术家 – 标题」（含全角破折号）
+            // 「艺术家 - 标题」/「艺术家 – 标题」（含全角破折号），仅当两端均非空时才同时赋值
             var sep = FindArtistSeparator(name);
             if (sep > 0)
             {
-                track.Artist = name.Substring(0, sep).Trim();
+                var artist = name.Substring(0, sep).Trim();
                 var rest = name.Substring(sep + 1).Trim();
-                if (rest.Length > 0) track.Title = rest;
+                if (artist.Length > 0 && rest.Length > 0)
+                {
+                    track.Artist = artist;
+                    track.Title = rest;
+                }
             }
 
             return track;
@@ -114,15 +124,22 @@ namespace Lumen.Models
 
         private static int FindArtistSeparator(string name)
         {
+            if (string.IsNullOrEmpty(name)) return -1;
+
             // 优先 " - "（带空格），避免把 "01-02" 这类编号误切
             int idx = name.IndexOf(" - ", StringComparison.Ordinal);
             if (idx > 0) return idx + 1;
 
             char[] dashes = { '–', '—', '−' };   // en/em dash、减号
-            for (int i = 0; i < name.Length; i++)
+            for (int i = 1; i < name.Length - 1; i++)
             {
-                if (Array.IndexOf(dashes, name[i]) >= 0 && i > 0 && i < name.Length - 1)
-                    return i;
+                if (Array.IndexOf(dashes, name[i]) < 0) continue;
+
+                // 无空格破折号排除纯数字范围（如 2024–2025、01–02）
+                if (char.IsDigit(name[i - 1]) && char.IsDigit(name[i + 1]))
+                    continue;
+
+                return i;
             }
             return -1;
         }

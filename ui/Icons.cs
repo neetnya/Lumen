@@ -1,4 +1,5 @@
 using System;
+using System.Collections.Concurrent;
 using System.Windows;
 using System.Windows.Media;
 
@@ -10,6 +11,9 @@ namespace Lumen.UI
     /// </summary>
     public static class Icons
     {
+        private static readonly ConcurrentDictionary<string, Geometry> _geometryCache =
+            new ConcurrentDictionary<string, Geometry>(StringComparer.Ordinal);
+
         // 播放 / 暂停
         public const string Play = "M4,2 L16,10 L4,18 Z";
         public const string Pause = "M4,3 H8 V17 H4 Z M12,3 H16 V17 H12 Z";
@@ -49,13 +53,24 @@ namespace Lumen.UI
         public const string PlaySmall = "M5,3 L15,10 L5,17 Z";
         public const string PauseSmall = "M6,4 H9 V16 H6 Z M11,4 H14 V16 H11 Z";
 
+        private static Geometry GetGeometry(string data)
+        {
+            if (string.IsNullOrEmpty(data)) return Geometry.Empty;
+            return _geometryCache.GetOrAdd(data, key =>
+            {
+                var geometry = Geometry.Parse(key);
+                if (geometry.CanFreeze) geometry.Freeze();
+                return geometry;
+            });
+        }
+
         /// <summary>把路径数据包成一个可任意缩放着色的图标元素。</summary>
         public static System.Windows.Shapes.Path Create(string data, double size, Brush fill, Brush stroke = null,
             double strokeThickness = 1.6)
         {
             var path = new System.Windows.Shapes.Path
             {
-                Data = Geometry.Parse(data),
+                Data = GetGeometry(data),
                 Width = size,
                 Height = size,
                 Stretch = Stretch.Uniform,

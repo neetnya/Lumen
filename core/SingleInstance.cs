@@ -1,9 +1,12 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.IO;
 using System.IO.Pipes;
+using System.Security.Cryptography;
+using System.Security.Principal;
 using System.Text;
 using System.Threading;
+using System.Threading.Tasks;
 
 namespace Lumen
 {
@@ -14,19 +17,119 @@ namespace Lumen
     /// </summary>
     public sealed class SingleInstance : IDisposable
     {
-        private const string MutexName = "Lumen.SingleInstance.Mutex";
-        private const string PipeName = "Lumen.SingleInstance.Pipe";
+        private const int MaxMessageBytes = 1024 * 1024;
+        private const int ReadTimeoutMs = 5000;
+
+        private static readonly string UserSuffix = ComputeUserSuffix();
+        private static readonly string MutexName = "Local\\Lumen.SingleInstance.Mutex." + UserSuffix;
+        private static readonly string PipeName = "Lumen.SingleInstance.Pipe." + UserSuffix;
+
+        private readonly object _eventGate = new object();
+        private readonly List<IList<string>> _pendingFiles = new List<IList<string>>();
+        private bool _pendingActivation;
+        private Action<IList<string>> _filesReceived;
+        private Action _activationRequested;
 
         private Mutex _mutex;
-        private Thread _listener;
+        private CancellationTokenSource _cts;
+        private Task _listenerTask;
         private volatile bool _running;
         private bool _owned;
+        private int _disposed;
 
-        /// <summary>收到另一个实例转交的文件。</summary>
-        public event Action<IList<string>> FilesReceived;
+        /// <summary>收到另一个实例转交的文件（若订阅前已收到消息会立即补发）。</summary>
+        public event Action<IList<string>> FilesReceived
+        {
+            add
+            {
+                List<IList<string>> replay = null;
+                lock (_eventGate)
+                {
+                    _filesReceived += value;
+                    if (value != null && _pendingFiles.Count > 0)
+                    {
+                        replay = new List<IList<string>>(_pendingFiles);
+                        _pendingFiles.Clear();
+                    }
+                }
 
-        /// <summary>另一个实例请求把窗口叫到前台。</summary>
-        public event Action ActivationRequested;
+                if (replay != null)
+                {
+                    foreach (var batch in replay)
+                    {
+                        try { value(batch); }
+                        catch (Exception ex) { Log.Warn("补发单实例文件失败: " + ex.Message); }
+                    }
+                }
+            }
+            remove
+            {
+                lock (_eventGate)
+                {
+                    _filesReceived -= value;
+                }
+            }
+        }
+
+        /// <summary>另一个实例请求把窗口叫到前台（若订阅前已收到请求会立即补发）。</summary>
+        public event Action ActivationRequested
+        {
+            add
+            {
+                bool replay = false;
+                lock (_eventGate)
+                {
+                    _activationRequested += value;
+                    if (value != null && _pendingActivation)
+                    {
+                        _pendingActivation = false;
+                        replay = true;
+                    }
+                }
+
+                if (replay)
+                {
+                    try { value(); }
+                    catch (Exception ex) { Log.Warn("补发单实例激活请求失败: " + ex.Message); }
+                }
+            }
+            remove
+            {
+                lock (_eventGate)
+                {
+                    _activationRequested -= value;
+                }
+            }
+        }
+
+        private static string ComputeUserSuffix()
+        {
+            string raw = null;
+            try
+            {
+                using (var identity = WindowsIdentity.GetCurrent())
+                {
+                    if (identity != null && identity.User != null)
+                    {
+                        raw = identity.User.Value;
+                    }
+                }
+            }
+            catch { }
+
+            if (string.IsNullOrEmpty(raw))
+            {
+                raw = Environment.UserDomainName + "\\" + Environment.UserName;
+            }
+
+            using (var sha = SHA256.Create())
+            {
+                var hash = sha.ComputeHash(Encoding.UTF8.GetBytes(raw));
+                var sb = new StringBuilder(16);
+                for (int i = 0; i < 8; i++) sb.Append(hash[i].ToString("x2"));
+                return sb.ToString();
+            }
+        }
 
         public bool TryAcquire()
         {
@@ -56,53 +159,115 @@ namespace Lumen
         private void StartListener()
         {
             _running = true;
-            _listener = new Thread(ListenLoop) { IsBackground = true, Name = "Lumen.SingleInstance" };
-            _listener.Start();
+            _cts = new CancellationTokenSource();
+            var token = _cts.Token;
+            _listenerTask = Task.Run(() => ListenLoopAsync(token), token);
         }
 
-        private void ListenLoop()
+        private async Task ListenLoopAsync(CancellationToken ct)
         {
-            while (_running)
+            while (_running && !ct.IsCancellationRequested)
             {
                 try
                 {
                     using (var server = new NamedPipeServerStream(
-                        PipeName, PipeDirection.In, 1,
-                        PipeTransmissionMode.Byte, PipeOptions.None))
+                        PipeName,
+                        PipeDirection.In,
+                        NamedPipeServerStream.MaxAllowedServerInstances,
+                        PipeTransmissionMode.Byte,
+                        PipeOptions.Asynchronous | PipeOptions.CurrentUserOnly))
                     {
-                        server.WaitForConnection();
+                        await server.WaitForConnectionAsync(ct).ConfigureAwait(false);
 
-                        using (var reader = new StreamReader(server, Encoding.UTF8))
-                        {
-                            var first = reader.ReadLine();
-                            var payload = reader.ReadToEnd();
+                        var message = await ReadLimitedMessageAsync(server, ct).ConfigureAwait(false);
+                        if (string.IsNullOrEmpty(message)) continue;
 
-                            if (string.Equals(first, "ACTIVATE", StringComparison.Ordinal))
-                            {
-                                var handler = ActivationRequested;
-                                if (handler != null) handler();
-                            }
-                            else if (string.Equals(first, "OPEN", StringComparison.Ordinal))
-                            {
-                                var files = new List<string>();
-                                foreach (var line in (payload ?? "").Split('\n'))
-                                {
-                                    var f = line.Trim();
-                                    if (f.Length > 0) files.Add(f);
-                                }
-                                if (files.Count > 0)
-                                {
-                                    var handler = FilesReceived;
-                                    if (handler != null) handler(files);
-                                }
-                            }
-                        }
+                        HandleMessage(message);
                     }
+                }
+                catch (OperationCanceledException)
+                {
+                    break;
                 }
                 catch (Exception ex)
                 {
-                    if (_running) Log.Warn("单实例监听异常: " + ex.Message);
-                    Thread.Sleep(200);
+                    if (_running && !ct.IsCancellationRequested)
+                    {
+                        Log.Warn("单实例监听异常: " + ex.Message);
+                        try { await Task.Delay(200, ct).ConfigureAwait(false); }
+                        catch (OperationCanceledException) { break; }
+                    }
+                }
+            }
+        }
+
+        private static async Task<string> ReadLimitedMessageAsync(Stream stream, CancellationToken ct)
+        {
+            using (var timeoutCts = CancellationTokenSource.CreateLinkedTokenSource(ct))
+            {
+                timeoutCts.CancelAfter(ReadTimeoutMs);
+                using (var ms = new MemoryStream())
+                {
+                    var buffer = new byte[4096];
+                    int total = 0;
+
+                    while (true)
+                    {
+                        int remaining = MaxMessageBytes - total;
+                        if (remaining <= 0)
+                        {
+                            Log.Warn("单实例管道消息超过 1MB 上限，已忽略");
+                            return null;
+                        }
+
+                        int toRead = Math.Min(buffer.Length, remaining);
+                        int read = await stream.ReadAsync(buffer, 0, toRead, timeoutCts.Token).ConfigureAwait(false);
+                        if (read <= 0) break;
+
+                        ms.Write(buffer, 0, read);
+                        total += read;
+                    }
+
+                    return Encoding.UTF8.GetString(ms.ToArray());
+                }
+            }
+        }
+
+        private void HandleMessage(string message)
+        {
+            using (var reader = new StringReader(message))
+            {
+                var first = reader.ReadLine();
+                if (string.Equals(first, "ACTIVATE", StringComparison.Ordinal))
+                {
+                    Action handler;
+                    lock (_eventGate)
+                    {
+                        handler = _activationRequested;
+                        if (handler == null) _pendingActivation = true;
+                    }
+                    if (handler != null) handler();
+                }
+                else if (string.Equals(first, "OPEN", StringComparison.Ordinal))
+                {
+                    var files = new List<string>();
+                    string line;
+                    while ((line = reader.ReadLine()) != null)
+                    {
+                        var f = line.Trim();
+                        if (f.Length > 0) files.Add(f);
+                    }
+
+                    if (files.Count > 0)
+                    {
+                        Action<IList<string>> handler;
+                        lock (_eventGate)
+                        {
+                            handler = _filesReceived;
+                            if (handler == null) _pendingFiles.Add(files);
+                        }
+                        if (handler != null) handler(files);
+                    }
                 }
             }
         }
@@ -114,7 +279,7 @@ namespace Lumen
 
             try
             {
-                using (var client = new NamedPipeClientStream(".", PipeName, PipeDirection.Out))
+                using (var client = new NamedPipeClientStream(".", PipeName, PipeDirection.Out, PipeOptions.CurrentUserOnly))
                 {
                     client.Connect(2000);
                     using (var writer = new StreamWriter(client, new UTF8Encoding(false)))
@@ -138,7 +303,7 @@ namespace Lumen
         {
             try
             {
-                using (var client = new NamedPipeClientStream(".", PipeName, PipeDirection.Out))
+                using (var client = new NamedPipeClientStream(".", PipeName, PipeDirection.Out, PipeOptions.CurrentUserOnly))
                 {
                     client.Connect(2000);
                     using (var writer = new StreamWriter(client, new UTF8Encoding(false)))
@@ -158,11 +323,7 @@ namespace Lumen
 
         /// <summary>
         /// 把主窗口带到前台并激活。
-        ///
-        /// Windows 对前台窗口有严格限制：一个不在前台的进程直接调
-        /// SetForegroundWindow 经常被系统忽略（表现就是「只高亮不拉起」）。
-        /// 这里用标准做法：先恢复最小化，再用 ShowWindow(SW_RESTORE) + 强制激活，
-        /// 必要时通过 AttachThreadInput 把前台权限借过来。
+        /// 仅在最小化时调用 SW_RESTORE，避免破坏最大化窗口，并保留原有 Topmost 状态。
         /// </summary>
         public static void BringToFront(System.Windows.Window window)
         {
@@ -173,18 +334,24 @@ namespace Lumen
                 if (helper.Handle == IntPtr.Zero) return;
 
                 var hwnd = helper.Handle;
+                bool wasMinimized = window.WindowState == System.Windows.WindowState.Minimized;
 
-                if (window.WindowState == System.Windows.WindowState.Minimized)
+                if (wasMinimized)
+                {
                     window.WindowState = System.Windows.WindowState.Normal;
+                    Native.Win32.ShowWindow(hwnd, 9 /*SW_RESTORE*/);
+                }
 
                 window.Show();
-
-                // 标准的三板斧：恢复 → 置顶再取消（骗过前台锁）→ 激活
-                Native.Win32.ShowWindow(hwnd, 9 /*SW_RESTORE*/);
                 Native.Win32.SetForegroundWindow(hwnd);
                 window.Activate();
-                window.Topmost = true;
-                window.Topmost = false;
+
+                bool previousTopmost = window.Topmost;
+                if (!previousTopmost)
+                {
+                    window.Topmost = true;
+                    window.Topmost = false;
+                }
                 window.Focus();
             }
             catch (Exception ex)
@@ -195,16 +362,15 @@ namespace Lumen
 
         public void Dispose()
         {
+            if (Interlocked.Exchange(ref _disposed, 1) != 0) return;
+
             _running = false;
-            try
+            if (_cts != null)
             {
-                // 敲一下管道让监听线程退出
-                using (var client = new NamedPipeClientStream(".", PipeName, PipeDirection.Out))
-                {
-                    client.Connect(100);
-                }
+                try { _cts.Cancel(); } catch { }
+                try { _cts.Dispose(); } catch { }
+                _cts = null;
             }
-            catch { }
 
             if (_mutex != null)
             {

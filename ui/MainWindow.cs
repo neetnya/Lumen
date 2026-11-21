@@ -1,9 +1,12 @@
 using System;
 using System.Collections.Generic;
+using System.Threading;
 using System.Windows;
 using System.Windows.Controls;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Media3D;
+using System.Windows.Threading;
 using Lumen.Audio;
 using Lumen.Media;
 using Lumen.Models;
@@ -15,11 +18,29 @@ namespace Lumen.UI
     /// </summary>
     public partial class MainWindow : WindowChromeBase
     {
+        private sealed class PlayRequest
+        {
+            public readonly int Generation;
+            public readonly string Path;
+            public readonly double StartAt;
+
+            public PlayRequest(int generation, string path, double startAt)
+            {
+                Generation = generation;
+                Path = path;
+                StartAt = startAt;
+            }
+        }
+
         private readonly CommandLine _options;
         private readonly SingleInstance _single;
         private readonly Player _player = new Player();
+        private readonly CancellationTokenSource _lifetimeCts = new CancellationTokenSource();
+        private readonly object _playQueueGate = new object();
+
         private Config _config;
         private MetadataFiller _filler;
+        private SplashCard _splash;
 
         private LyricsPane _lyricsPane;
         private TrackListPane _listPane;
@@ -28,11 +49,29 @@ namespace Lumen.UI
         private DesktopLyricsWindow _desktopLyrics;
         private TrayIcon _tray;
         private MediaKeys _mediaKeys;
-        private System.Windows.Threading.DispatcherTimer _playbackTimer;
+        private DispatcherTimer _playbackTimer;
 
         private Group _group;
         private List<Track> _view = new List<Track>();
         private int _currentIndex = -1;
+
+        private volatile bool _isClosed;
+        private int _playGeneration;
+        private PlayRequest _pendingPlayRequest;
+        private bool _playWorkerRunning;
+        private int _consecutiveFailures;
+
+        private Lyrics.LyricsDocument _currentLyrics;
+        private string _currentLyricsPath;
+
+        private double _lastKnownPosition;
+        private bool _playbackEnded;
+        private DateTime _lastProgressSave = DateTime.UtcNow;
+        private string _lastSavedTrackPath;
+        private double _lastSavedPositionSeconds = -1;
+
+        private bool _lyricsPaneUserCollapsed;
+        private bool _reallyExit;
 
         public MainWindow(CommandLine options, SingleInstance single)
         {
@@ -47,6 +86,10 @@ namespace Lumen.UI
             // 首次打开（没有保存过位置时）出现在屏幕正中央
             WindowStartupLocation = WindowStartupLocation.CenterScreen;
 
+            // 提前订阅关闭事件，防止初始化中途异常导致资源泄漏
+            Closing += OnClosing;
+            Closed += OnClosed;
+
             _config = Config.Load();
             _group = _config.EnsureGroup();
         }
@@ -54,28 +97,28 @@ namespace Lumen.UI
         /// <summary>窗口显示后初始化（启动卡片此时可以收起）。</summary>
         public void InitializeAfterShow(SplashCard splash)
         {
+            _splash = splash;
             try
             {
                 RestoreWindowPlacement();
                 TitleBar = BuildTitleBar();
                 Body = BuildBody();
+
                 _filler = new MetadataFiller(Dispatcher);
-                _filler.BatchCompleted += delegate { RefreshList(false); };
-                _filler.AllCompleted += delegate
-                {
-                    RefreshList(false);
-                    if (splash != null) splash.Dismiss();
-                };
+                _filler.BatchCompleted += OnMetadataBatchCompleted;
+                _filler.AllCompleted += OnMetadataAllCompleted;
+
                 HookPlayer();
                 HookSingleInstance();
                 HookHotkeys();
                 HookMediaKeys();
                 PreviewKeyDown += OnPreviewKeyDown;
+
                 ApplyGroup(_group, false);
                 QueueMetadata();
 
                 // 恢复上次播放位置：每个分组各自记忆（不会自动播放）
-                RestoreGroupProgress();
+                RestoreGroupProgress(true);
 
                 // 处理命令行带来的文件
                 if (_options.Files.Count > 0) OpenExternalFiles(_options.Files);
@@ -84,13 +127,7 @@ namespace Lumen.UI
                 UpdateVolumeUi();
 
                 // 桌面歌词：位置、字号、行数、锁定状态都会记住
-                if (_desktopLyrics == null)
-                {
-                    _desktopLyrics = new DesktopLyricsWindow();
-                    HookDesktopLyrics(_desktopLyrics);
-                    _desktopLyrics.SetSavedPosition(
-                        _config.DesktopLyricsLeft, _config.DesktopLyricsTop);
-                }
+                EnsureDesktopLyrics();
                 SyncDesktopLyrics();
 
                 // 托盘常驻
@@ -102,15 +139,20 @@ namespace Lumen.UI
                 StartPlaybackTimer();
 
                 // 没有待补全的元数据时，直接收起启动卡片
-                if (_filler.PendingCount == 0 && splash != null) splash.Dismiss();
-
-                Closing += OnClosing;
-                Closed += OnClosed;
+                if (_filler.PendingCount == 0 && _splash != null)
+                {
+                    _splash.Dismiss();
+                    _splash = null;
+                }
             }
             catch (Exception ex)
             {
                 Log.Error("初始化主窗口失败", ex);
-                if (splash != null) splash.Dismiss();
+                if (_splash != null)
+                {
+                    _splash.Dismiss();
+                    _splash = null;
+                }
                 Dialogs.ShowError(this, "启动失败", ex.Message);
             }
         }
@@ -220,7 +262,7 @@ namespace Lumen.UI
             _listPane.RenameGroupRequested += delegate { RenameGroup(); };
             _listPane.DeleteGroupRequested += delegate { DeleteGroup(); };
             _listPane.GroupSelected += delegate (string id) { SwitchGroup(id); };
-            _listPane.FilesDropped += delegate (IList<string> files) { ImportPaths(files); };
+            _listPane.FilesDropped += delegate (IList<string> files) { ImportPaths(files, true); };
             Grid.SetColumn(_listPane, 1);
             _splitBody.Children.Add(_listPane);
 
@@ -238,6 +280,7 @@ namespace Lumen.UI
                 _config.VolumePercent = (int)Math.Round(v * 100);
                 _player.Volume = v;
                 _config.Muted = false;
+                _player.Muted = false;
                 UpdateVolumeUi();
             };
             _bottomBar.VolumeDelta += delegate (float delta) { NudgeVolume(delta); };
@@ -255,6 +298,33 @@ namespace Lumen.UI
         }
 
         // ------------------------------------------------------------------
+        // 元数据回调
+        // ------------------------------------------------------------------
+
+        private void OnMetadataBatchCompleted(IList<Track> updated)
+        {
+            if (_isClosed || Dispatcher.HasShutdownStarted) return;
+            if (_listPane != null)
+            {
+                _listPane.RefreshRows(updated);
+                _listPane.SetPlaying(_currentIndexPath());
+            }
+        }
+
+        private void OnMetadataAllCompleted()
+        {
+            if (_isClosed || Dispatcher.HasShutdownStarted) return;
+            bool sortByDuration = _config != null &&
+                (_config.SortMode == TrackSorter.Duration || _config.SortMode == TrackSorter.DurationDesc);
+            RefreshList(sortByDuration);
+            if (_splash != null)
+            {
+                _splash.Dismiss();
+                _splash = null;
+            }
+        }
+
+        // ------------------------------------------------------------------
         // 分组 / 列表
         // ------------------------------------------------------------------
 
@@ -262,16 +332,17 @@ namespace Lumen.UI
         {
             _group = group ?? _config.EnsureGroup();
             _config.CurrentGroupId = _group.Id;
+            _lastKnownPosition = 0;
+            _playbackEnded = false;
+            _consecutiveFailures = 0;
+
+            _listPane.ClearSearch();
             _listPane.SetGroups(_config.Groups, _group.Id);
             RebuildView();
 
-            if (restorePosition && !string.IsNullOrEmpty(_group.LastTrackPath))
+            if (restorePosition)
             {
-                _player.Load(_group.LastTrackPath, _group.LastPositionSeconds);
-                _currentIndex = IndexOfPath(_group.LastTrackPath);
-                _listPane.SetPlaying(_currentIndex);
-                LoadLyricsFor(_group.LastTrackPath);
-                UpdateBottomBar();
+                RestoreGroupProgress(false);
             }
         }
 
@@ -315,6 +386,18 @@ namespace Lumen.UI
             return -1;
         }
 
+        private static bool GroupContainsPath(Group group, string path)
+        {
+            if (group == null || group.Tracks == null || string.IsNullOrEmpty(path)) return false;
+            for (int i = 0; i < group.Tracks.Count; i++)
+            {
+                var t = group.Tracks[i];
+                if (t != null && string.Equals(t.Path, path, StringComparison.OrdinalIgnoreCase))
+                    return true;
+            }
+            return false;
+        }
+
         private void RefreshList(bool rebuildView)
         {
             if (rebuildView) RebuildView();
@@ -322,20 +405,65 @@ namespace Lumen.UI
             _listPane.SetPlaying(_currentIndexPath());
         }
 
+        /// <summary>停止播放并同步清空歌词区、桌面歌词、底栏及（可选）当前分组记忆进度。</summary>
+        private void StopPlaybackAndClearUi(bool clearGroupProgress = true)
+        {
+            Interlocked.Increment(ref _playGeneration);
+            lock (_playQueueGate)
+            {
+                _pendingPlayRequest = null;
+            }
+
+            _player.Stop();
+            _currentIndex = -1;
+            _lastKnownPosition = 0;
+            _playbackEnded = false;
+            _currentLyrics = null;
+            _currentLyricsPath = null;
+
+            if (clearGroupProgress && _group != null)
+            {
+                _group.LastTrackPath = null;
+                _group.LastPositionSeconds = 0;
+            }
+
+            if (_listPane != null) _listPane.SetPlaying(-1);
+            if (_lyricsPane != null) _lyricsPane.SetLyrics(null);
+            if (_desktopLyrics != null)
+            {
+                _desktopLyrics.SetLyrics(null);
+                _desktopLyrics.SetPlaying(false);
+            }
+
+            UpdateBottomBar();
+            SyncPlaybackTimerState();
+        }
+
         /// <summary>批量移除（仅从列表移除，不删文件）。</summary>
         private void RemoveTracks(IList<Track> tracks)
         {
             if (tracks == null || tracks.Count == 0 || _group == null) return;
 
+            bool stoppedCurrent = false;
             foreach (var t in tracks)
             {
+                if (t == null) continue;
                 _group.Tracks.Remove(t);
                 if (_group.ShuffledOrder != null) _group.ShuffledOrder.Remove(t.Path);
+                if (string.Equals(_group.LastTrackPath, t.Path, StringComparison.OrdinalIgnoreCase))
+                {
+                    _group.LastTrackPath = null;
+                    _group.LastPositionSeconds = 0;
+                }
                 if (string.Equals(_player.CurrentPath, t.Path, StringComparison.OrdinalIgnoreCase))
                 {
-                    _player.Stop();
-                    _currentIndex = -1;
+                    stoppedCurrent = true;
                 }
+            }
+
+            if (stoppedCurrent)
+            {
+                StopPlaybackAndClearUi(true);
             }
 
             RebuildView();
@@ -373,7 +501,7 @@ namespace Lumen.UI
         /// <summary>右键菜单「删除此文件」：单首送回收站不确认；多选会先确认。</summary>
         private void DeleteTrackFiles(IList<Track> tracks)
         {
-            if (tracks == null || tracks.Count == 0) return;
+            if (tracks == null || tracks.Count == 0 || _group == null) return;
 
             if (tracks.Count > 1)
             {
@@ -384,17 +512,32 @@ namespace Lumen.UI
             }
 
             int ok = 0;
+            int removedMissing = 0;
             foreach (var track in tracks)
             {
                 if (track == null || string.IsNullOrEmpty(track.Path)) continue;
-                if (!System.IO.File.Exists(track.Path)) continue;
+
+                bool isPlayingThis = string.Equals(_player.CurrentPath, track.Path, StringComparison.OrdinalIgnoreCase);
+
+                if (!System.IO.File.Exists(track.Path))
+                {
+                    if (isPlayingThis) StopPlaybackAndClearUi(true);
+                    if (string.Equals(_group.LastTrackPath, track.Path, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _group.LastTrackPath = null;
+                        _group.LastPositionSeconds = 0;
+                    }
+                    _group.Tracks.Remove(track);
+                    if (_group.ShuffledOrder != null) _group.ShuffledOrder.Remove(track.Path);
+                    removedMissing++;
+                    continue;
+                }
 
                 var name = System.IO.Path.GetFileName(track.Path);
 
-                if (string.Equals(_player.CurrentPath, track.Path, StringComparison.OrdinalIgnoreCase))
+                if (isPlayingThis)
                 {
-                    _player.Stop();
-                    _currentIndex = -1;
+                    StopPlaybackAndClearUi(true);
                 }
 
                 int result = Native.Win32.DeleteToRecycleBin(track.Path);
@@ -405,6 +548,11 @@ namespace Lumen.UI
                     continue;
                 }
 
+                if (string.Equals(_group.LastTrackPath, track.Path, StringComparison.OrdinalIgnoreCase))
+                {
+                    _group.LastTrackPath = null;
+                    _group.LastPositionSeconds = 0;
+                }
                 _group.Tracks.Remove(track);
                 if (_group.ShuffledOrder != null) _group.ShuffledOrder.Remove(track.Path);
                 ok++;
@@ -412,7 +560,12 @@ namespace Lumen.UI
 
             RebuildView();
             SaveConfig();
-            if (ok > 0) _listPane.FlashStatus("已送进回收站 " + ok + " 首");
+            if (ok > 0 && removedMissing > 0)
+                _listPane.FlashStatus("已送进回收站 " + ok + " 首，移除失效 " + removedMissing + " 首");
+            else if (ok > 0)
+                _listPane.FlashStatus("已送进回收站 " + ok + " 首");
+            else if (removedMissing > 0)
+                _listPane.FlashStatus("已移除 " + removedMissing + " 首失效项");
         }
 
         private static void RevealInExplorer(Track track)
@@ -461,7 +614,7 @@ namespace Lumen.UI
                 Filter = "音频文件|*.mp3;*.flac;*.wav;*.m4a;*.aac;*.ogg;*.opus;*.wma;*.ape;*.aiff;*.aif;*.mp4|所有文件|*.*",
                 Title = "导入文件"
             };
-            if (dialog.ShowDialog(this) == true) ImportPaths(dialog.FileNames);
+            if (dialog.ShowDialog(this) == true) ImportPaths(dialog.FileNames, false);
         }
 
         private void ImportFolder()
@@ -488,20 +641,23 @@ namespace Lumen.UI
                 createNew = choice == true;
             }
 
-            var order = NextAddedOrder();
+            var targetGroup = _group;
             var folderPath = folder;
             var groupName = name;
             var makeNew = createNew;
+            var token = _lifetimeCts.Token;
 
             // 扫描放后台，避免大文件夹把界面冻住
             _listPane.FlashStatus("正在扫描…");
 
-            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            ThreadPool.QueueUserWorkItem(delegate
             {
+                if (token.IsCancellationRequested || _isClosed) return;
+
                 List<Track> tracks;
                 try
                 {
-                    int counter = order;
+                    int counter = 0;
                     tracks = MediaScanner.FromFiles(new[] { folderPath }, ref counter);
                 }
                 catch (Exception ex)
@@ -510,14 +666,22 @@ namespace Lumen.UI
                     tracks = new List<Track>();
                 }
 
+                if (token.IsCancellationRequested || _isClosed) return;
+
                 Dispatcher.BeginInvoke(new Action(delegate
                 {
+                    if (_isClosed || Dispatcher.HasShutdownStarted) return;
+
                     if (tracks.Count == 0)
                     {
                         Dialogs.ShowInfo(this, "没有找到音频", "这个文件夹里没有找到支持的音频文件。");
                         _listPane.FlashStatus("");
                         return;
                     }
+
+                    // 回到 UI 线程实时分配递增的 AddedOrder，避免并发导入顺序冲突
+                    int nextOrder = NextAddedOrder();
+                    for (int i = 0; i < tracks.Count; i++) tracks[i].AddedOrder = nextOrder++;
 
                     if (makeNew)
                     {
@@ -532,33 +696,41 @@ namespace Lumen.UI
                     }
                     else
                     {
-                        AddTracks(tracks);
+                        if (targetGroup == null || !_config.Groups.Contains(targetGroup))
+                        {
+                            _listPane.FlashStatus("目标分组已不存在，导入已取消");
+                            return;
+                        }
+                        AddTracksToGroup(targetGroup, tracks);
                     }
 
                     _filler.Enqueue(tracks);
                     SaveConfig();
                     _listPane.FlashStatus("已导入 " + tracks.Count + " 首");
-                }), System.Windows.Threading.DispatcherPriority.Background);
+                }), DispatcherPriority.Background);
             });
         }
 
-        private void ImportPaths(IList<string> paths)
+        private void ImportPaths(IList<string> paths, bool fromDrop)
         {
             if (paths == null || paths.Count == 0) return;
 
             // 扫描放到后台线程：600 首要走几千次目录枚举 + 文件属性读取，
             // 放在 UI 线程会直接把界面冻住好几秒。
             var snapshot = new List<string>(paths);
-            int baseOrder = NextAddedOrder();
+            var targetGroup = _group;
+            var token = _lifetimeCts.Token;
 
             _listPane.FlashStatus("正在扫描…");
 
-            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            ThreadPool.QueueUserWorkItem(delegate
             {
+                if (token.IsCancellationRequested || _isClosed) return;
+
                 List<Track> tracks;
                 try
                 {
-                    int order = baseOrder;
+                    int order = 0;
                     tracks = MediaScanner.FromFiles(snapshot, ref order);
                 }
                 catch (Exception ex)
@@ -567,41 +739,76 @@ namespace Lumen.UI
                     tracks = new List<Track>();
                 }
 
+                if (token.IsCancellationRequested || _isClosed) return;
+
                 Dispatcher.BeginInvoke(new Action(delegate
                 {
+                    if (_isClosed || Dispatcher.HasShutdownStarted) return;
+
                     if (tracks.Count == 0)
                     {
-                        Dialogs.ShowInfo(this, "没有找到音频", "拖进来的内容里没有支持的音频文件。");
+                        string tip = fromDrop
+                            ? "拖进来的内容里没有支持的音频文件。"
+                            : "所选内容里没有支持的音频文件。";
+                        Dialogs.ShowInfo(this, "没有找到音频", tip);
                         _listPane.FlashStatus("");
                         return;
                     }
 
-                    AddTracks(tracks);
+                    if (targetGroup == null || !_config.Groups.Contains(targetGroup))
+                    {
+                        _listPane.FlashStatus("目标分组已不存在，导入已取消");
+                        return;
+                    }
+
+                    int nextOrder = NextAddedOrder();
+                    for (int i = 0; i < tracks.Count; i++) tracks[i].AddedOrder = nextOrder++;
+
+                    AddTracksToGroup(targetGroup, tracks);
                     _filler.Enqueue(tracks);
                     SaveConfig();
                     _listPane.FlashStatus("已导入 " + tracks.Count + " 首");
-                }), System.Windows.Threading.DispatcherPriority.Background);
+                }), DispatcherPriority.Background);
             });
         }
 
         private void AddTracks(List<Track> tracks)
         {
-            if (_group == null) return;
+            AddTracksToGroup(_group, tracks);
+        }
+
+        private void AddTracksToGroup(Group targetGroup, List<Track> tracks)
+        {
+            if (targetGroup == null || tracks == null || tracks.Count == 0) return;
             var existing = new HashSet<string>(StringComparer.OrdinalIgnoreCase);
-            foreach (var t in _group.Tracks) existing.Add(t.Path);
+            foreach (var t in targetGroup.Tracks)
+            {
+                if (t != null && !string.IsNullOrEmpty(t.Path)) existing.Add(t.Path);
+            }
 
             bool added = false;
             foreach (var t in tracks)
             {
+                if (t == null || string.IsNullOrEmpty(t.Path)) continue;
                 if (existing.Contains(t.Path)) continue;
-                _group.Tracks.Add(t);
+                targetGroup.Tracks.Add(t);
                 existing.Add(t.Path);
                 added = true;
             }
 
-            // 重新导入即恢复有序（README）
-            _group.ShuffledOrder = null;
-            if (added) RebuildView();
+            if (added)
+            {
+                // 重新导入有新增曲目时才恢复有序（README）
+                targetGroup.ShuffledOrder = null;
+                if (ReferenceEquals(targetGroup, _group))
+                {
+                    RebuildView();
+                }
+                else if (_listPane != null && _group != null)
+                {
+                    _listPane.SetGroups(_config.Groups, _group.Id);
+                }
+            }
         }
 
         private int NextAddedOrder()
@@ -655,8 +862,7 @@ namespace Lumen.UI
 
             var removing = _group;
             _config.Groups.Remove(removing);
-            _player.Stop();
-            _currentIndex = -1;
+            StopPlaybackAndClearUi(true);
             _config.CurrentGroupId = _config.Groups[0].Id;
             ApplyGroup(_config.Groups[0], false);
             SaveConfig();
@@ -668,26 +874,56 @@ namespace Lumen.UI
 
         private void HookPlayer()
         {
-            _player.PlaybackEnded += delegate
-            {
-                Dispatcher.BeginInvoke(new Action(delegate { OnTrackEnded(); }));
-            };
-            _player.PlaybackFailed += delegate (string message)
-            {
-                Dispatcher.BeginInvoke(new Action(delegate
-                {
-                    _listPane.FlashStatus(message);
-                    // 播放失败自动跳到下一首（README）
-                    if (_view.Count > 1) PlayNext(false);
-                }));
-            };
+            _player.PlaybackEnded += OnPlayerPlaybackEnded;
+            _player.PlaybackFailed += OnPlayerPlaybackFailed;
         }
 
-        private int _playGeneration;
+        private void OnPlayerPlaybackEnded()
+        {
+            if (_isClosed) return;
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                if (_isClosed || Dispatcher.HasShutdownStarted) return;
+                OnTrackEnded();
+            }));
+        }
+
+        private void OnPlayerPlaybackFailed(string message)
+        {
+            if (_isClosed) return;
+            Dispatcher.BeginInvoke(new Action(delegate
+            {
+                if (_isClosed || Dispatcher.HasShutdownStarted) return;
+
+                _consecutiveFailures++;
+                int circuitLimit = Math.Min(_view.Count, 5);
+                if (_view.Count <= 1 || circuitLimit <= 0 || _consecutiveFailures >= circuitLimit)
+                {
+                    _listPane.FlashStatus("连续播放失败，已停止自动切歌：" + message);
+                    UpdateBottomBar();
+                    SyncPlaybackTimerState();
+                    return;
+                }
+
+                _listPane.FlashStatus(message);
+                // 播放失败自动跳到下一首（README）
+                PlayNext(false);
+            }));
+        }
 
         private void PlayTrack(Track track)
         {
-            if (track == null) return;
+            PlayTrack(track, false);
+        }
+
+        private void PlayTrack(Track track, bool isAutoAdvance)
+        {
+            if (_isClosed || track == null) return;
+
+            if (!isAutoAdvance)
+            {
+                _consecutiveFailures = 0;
+            }
 
             // 文件已被删除：不再尝试播放，直接提示，避免解码/打开句柄卡死
             if (!string.IsNullOrEmpty(track.Path) && !System.IO.File.Exists(track.Path))
@@ -696,31 +932,86 @@ namespace Lumen.UI
                 return;
             }
 
-            var index = _view.IndexOf(track);
-            var startAt = 0.0;
+            // 启动时即推进尝试游标，防止失败后游标停滞导致反复重试同一首
+            int index = _view.IndexOf(track);
+            if (index < 0) index = IndexOfPath(track.Path);
+            if (index >= 0) _currentIndex = index;
 
-            // 同一首再次双击则从头播放
-            if (index >= 0 && string.Equals(_player.CurrentPath, track.Path, StringComparison.OrdinalIgnoreCase))
-                startAt = 0;
-
-            // 解码放后台，避免难文件把界面卡住
-            int gen = System.Threading.Interlocked.Increment(ref _playGeneration);
+            double startAt = 0.0;
+            int gen = Interlocked.Increment(ref _playGeneration);
             string path = track.Path;
-            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+
+            // 串行单循环播放队列：快速切歌时仅保留最新请求，避免并发 Play 导致音画撕裂
+            bool startWorker = false;
+            lock (_playQueueGate)
             {
-                bool ok = _player.Play(path, startAt);
+                _pendingPlayRequest = new PlayRequest(gen, path, startAt);
+                if (!_playWorkerRunning)
+                {
+                    _playWorkerRunning = true;
+                    startWorker = true;
+                }
+            }
+
+            if (startWorker)
+            {
+                ThreadPool.QueueUserWorkItem(delegate { ProcessPlayQueue(); });
+            }
+        }
+
+        private void ProcessPlayQueue()
+        {
+            while (true)
+            {
+                PlayRequest req;
+                lock (_playQueueGate)
+                {
+                    if (_isClosed || _pendingPlayRequest == null)
+                    {
+                        _playWorkerRunning = false;
+                        return;
+                    }
+                    req = _pendingPlayRequest;
+                    _pendingPlayRequest = null;
+                }
+
+                // 进入 _player.Play() 前校验代数与窗口存活状态
+                if (_isClosed || req.Generation != Volatile.Read(ref _playGeneration))
+                    continue;
+
+                bool ok = false;
+                try
+                {
+                    ok = _player.Play(req.Path, req.StartAt);
+                }
+                catch (Exception ex)
+                {
+                    Log.Warn("后台播放异常: " + ex.Message);
+                }
+
+                // 返回后再次校验代数与窗口存活状态
+                if (_isClosed || req.Generation != Volatile.Read(ref _playGeneration))
+                    continue;
+
+                if (!ok) continue;
+
+                var captured = req;
                 Dispatcher.BeginInvoke(new Action(delegate
                 {
-                    if (gen != _playGeneration) return;
-                    if (!ok) return;
-                    _currentIndex = index;
-                    _lastKnownPosition = startAt;
+                    if (_isClosed || Dispatcher.HasShutdownStarted) return;
+                    if (captured.Generation != Volatile.Read(ref _playGeneration)) return;
+
+                    int resolvedIndex = IndexOfPath(captured.Path);
+                    _consecutiveFailures = 0;
+                    _currentIndex = resolvedIndex;
+                    _lastKnownPosition = captured.StartAt;
                     _playbackEnded = false;
-                    _listPane.SetPlaying(index);
-                    LoadLyricsFor(path);
+                    _listPane.SetPlaying(resolvedIndex);
+                    LoadLyricsFor(captured.Path);
                     UpdateBottomBar();
+                    SyncPlaybackTimerState();
                 }));
-            });
+            }
         }
 
         private void TogglePlayPause()
@@ -735,26 +1026,42 @@ namespace Lumen.UI
 
             _player.TogglePlayPause();
             UpdateBottomBar();
+            if (_desktopLyrics != null && _config.DesktopLyricsVisible)
+                _desktopLyrics.SetPlaying(_player.IsPlaying);
+            SyncPlaybackTimerState();
+        }
+
+        private Track ResolveRepeatOneTrack()
+        {
+            if (_view.Count == 0) return null;
+
+            int byPath = _currentIndexPath();
+            if (byPath >= 0 && byPath < _view.Count)
+                return _view[byPath];
+
+            int clamped = Math.Max(0, Math.Min(_currentIndex, _view.Count - 1));
+            return _view[clamped];
         }
 
         private void PlayNext(bool fromUser)
         {
             if (_view.Count == 0) return;
 
+            if (fromUser) _consecutiveFailures = 0;
+
             if (_player.Mode == Player.PlayMode.RepeatOne && !fromUser)
             {
-                PlayTrack(_view[Math.Max(0, _currentIndex)]);
+                var repeatTrack = ResolveRepeatOneTrack();
+                if (repeatTrack != null) PlayTrack(repeatTrack, true);
                 return;
             }
 
             int next = _currentIndex + 1;
-            if (next >= _view.Count)
+            if (next < 0 || next >= _view.Count)
             {
-                if (_player.Mode == Player.PlayMode.Sequential)
+                if (_player.Mode == Player.PlayMode.Sequential && next >= _view.Count)
                 {
-                    _player.Stop();
-                    _listPane.SetPlaying(-1);
-                    UpdateBottomBar();
+                    StopPlaybackAndClearUi(false);
                     return;
                 }
                 next = 0;
@@ -765,9 +1072,9 @@ namespace Lumen.UI
             while (attempts-- > 0)
             {
                 var t = _view[next];
-                if (!string.IsNullOrEmpty(t.Path) && System.IO.File.Exists(t.Path))
+                if (t != null && !string.IsNullOrEmpty(t.Path) && System.IO.File.Exists(t.Path))
                 {
-                    PlayTrack(t);
+                    PlayTrack(t, !fromUser);
                     return;
                 }
 
@@ -776,27 +1083,55 @@ namespace Lumen.UI
                 {
                     if (_player.Mode == Player.PlayMode.Sequential)
                     {
-                        _player.Stop();
-                        _listPane.SetPlaying(-1);
-                        UpdateBottomBar();
+                        StopPlaybackAndClearUi(false);
                         return;
                     }
                     next = 0;
                 }
             }
 
-            _player.Stop();
-            _listPane.SetPlaying(-1);
-            UpdateBottomBar();
+            StopPlaybackAndClearUi(false);
         }
 
         private void PlayPrevious()
         {
             if (_view.Count == 0) return;
 
+            _consecutiveFailures = 0;
+
             int prev = _currentIndex - 1;
-            if (prev < 0) prev = _player.Mode == Player.PlayMode.Sequential ? 0 : _view.Count - 1;
-            PlayTrack(_view[prev]);
+            if (prev < 0 || prev >= _view.Count)
+            {
+                if (_player.Mode == Player.PlayMode.Sequential)
+                    prev = 0;
+                else
+                    prev = _view.Count - 1;
+            }
+
+            // 与 PlayNext 对称：跳过已失效（文件不存在）的曲目，最多找一圈
+            int attempts = _view.Count;
+            while (attempts-- > 0)
+            {
+                var t = _view[prev];
+                if (t != null && !string.IsNullOrEmpty(t.Path) && System.IO.File.Exists(t.Path))
+                {
+                    PlayTrack(t, false);
+                    return;
+                }
+
+                prev--;
+                if (prev < 0)
+                {
+                    if (_player.Mode == Player.PlayMode.Sequential)
+                    {
+                        StopPlaybackAndClearUi(false);
+                        return;
+                    }
+                    prev = _view.Count - 1;
+                }
+            }
+
+            StopPlaybackAndClearUi(false);
         }
 
         private void OnTrackEnded()
@@ -804,11 +1139,18 @@ namespace Lumen.UI
             // 当前曲目已放到结尾：进度按 README 归零（下次从头开始）
             _playbackEnded = true;
             SaveGroupProgress();
-            _config.Save();
+            _config.SaveAsync();
+
+            if (_view.Count == 0)
+            {
+                SyncPlaybackTimerState();
+                return;
+            }
 
             if (_player.Mode == Player.PlayMode.RepeatOne)
             {
-                PlayTrack(_view[Math.Max(0, _currentIndex)]);
+                var repeatTrack = ResolveRepeatOneTrack();
+                if (repeatTrack != null) PlayTrack(repeatTrack, true);
                 return;
             }
             PlayNext(false);
@@ -828,7 +1170,12 @@ namespace Lumen.UI
         {
             if (!_player.HasTrack) return;
             _player.Seek(seconds);
+            _lastKnownPosition = Math.Max(0, seconds);
+            _playbackEnded = IsAtEnd(_lastKnownPosition, _player.DurationSeconds);
             UpdateBottomBar();
+            _lyricsPane.UpdatePosition(_player.PositionSeconds, true);
+            if (_desktopLyrics != null && _config.DesktopLyricsVisible && _player.IsPlaying)
+                _desktopLyrics.UpdatePosition(_player.PositionSeconds);
         }
 
         // ------------------------------------------------------------------
@@ -839,17 +1186,27 @@ namespace Lumen.UI
         {
             if (string.IsNullOrEmpty(path))
             {
+                _currentLyrics = null;
+                _currentLyricsPath = null;
                 _lyricsPane.SetLyrics(null);
                 if (_desktopLyrics != null) _desktopLyrics.SetLyrics(null);
                 return;
             }
 
+            if (!string.Equals(_currentLyricsPath, path, StringComparison.OrdinalIgnoreCase))
+            {
+                _currentLyrics = null;
+                _currentLyricsPath = path;
+            }
+
             var duration = _player.DurationSeconds;
+            var token = _lifetimeCts.Token;
 
             // 读歌词要走磁盘；缓存未命中时放后台，避免切歌时卡一下。
-            // 切歌必须秒响应，所以这里先清空再异步填。
-            System.Threading.ThreadPool.QueueUserWorkItem(delegate
+            ThreadPool.QueueUserWorkItem(delegate
             {
+                if (token.IsCancellationRequested || _isClosed) return;
+
                 Lyrics.LyricsDocument doc = null;
                 try
                 {
@@ -860,19 +1217,30 @@ namespace Lumen.UI
                     Log.Warn("加载歌词失败: " + ex.Message);
                 }
 
+                if (token.IsCancellationRequested || _isClosed) return;
+
                 Dispatcher.BeginInvoke(new Action(delegate
                 {
+                    if (_isClosed || Dispatcher.HasShutdownStarted) return;
                     // 期间又切歌了：丢弃这次结果
                     if (!string.Equals(_player.CurrentPath, path, StringComparison.OrdinalIgnoreCase)) return;
 
+                    _currentLyrics = doc;
+                    _currentLyricsPath = path;
                     _lyricsPane.SetLyrics(doc);
-                    if (_desktopLyrics != null) _desktopLyrics.SetLyrics(doc);
+                    if (_desktopLyrics != null)
+                    {
+                        _desktopLyrics.SetLyrics(doc);
+                        if (_config.DesktopLyricsVisible)
+                        {
+                            _desktopLyrics.SetPlaying(_player.IsPlaying);
+                            if (_player.IsPlaying) _desktopLyrics.UpdatePosition(_player.PositionSeconds);
+                        }
+                    }
                     AutoToggleLyricsPane(doc);
-                }), System.Windows.Threading.DispatcherPriority.Background);
+                }), DispatcherPriority.Background);
             });
         }
-
-        private bool _lyricsPaneUserCollapsed;
 
         private void AutoToggleLyricsPane(Lyrics.LyricsDocument doc)
         {
@@ -925,29 +1293,51 @@ namespace Lumen.UI
 
         private void HookDesktopLyrics(DesktopLyricsWindow window)
         {
-            window.PositionChanged += delegate (double left, double top, double height)
-            {
-                _config.DesktopLyricsLeft = left;
-                _config.DesktopLyricsTop = top;
-                _config.DesktopLyricsHeight = height;
-            };
-            window.LockChanged += delegate (bool locked)
-            {
-                _config.DesktopLyricsLocked = locked;
-                SaveConfig();
-                if (_tray != null) _tray.UpdateState();
-            };
-            window.FontScaleChanged += delegate (double scale)
-            {
-                _config.DesktopLyricsFontScale = scale;
-                SaveConfig();
-            };
-            window.HiddenRequested += delegate
-            {
-                _config.DesktopLyricsVisible = false;
-                SyncDesktopLyrics();
-                SaveConfig();
-            };
+            window.PositionChanged += OnDesktopLyricsPositionChanged;
+            window.LockChanged += OnDesktopLyricsLockChanged;
+            window.FontScaleChanged += OnDesktopLyricsFontScaleChanged;
+            window.HiddenRequested += OnDesktopLyricsHiddenRequested;
+        }
+
+        private void UnhookDesktopLyrics(DesktopLyricsWindow window)
+        {
+            if (window == null) return;
+            window.PositionChanged -= OnDesktopLyricsPositionChanged;
+            window.LockChanged -= OnDesktopLyricsLockChanged;
+            window.FontScaleChanged -= OnDesktopLyricsFontScaleChanged;
+            window.HiddenRequested -= OnDesktopLyricsHiddenRequested;
+        }
+
+        private void OnDesktopLyricsPositionChanged(double left, double top, double height)
+        {
+            if (_isClosed) return;
+            _config.DesktopLyricsLeft = left;
+            _config.DesktopLyricsTop = top;
+            _config.DesktopLyricsHeight = height;
+            _config.SaveAsync();
+        }
+
+        private void OnDesktopLyricsLockChanged(bool locked)
+        {
+            if (_isClosed) return;
+            _config.DesktopLyricsLocked = locked;
+            SaveConfig();
+            if (_tray != null) _tray.UpdateState();
+        }
+
+        private void OnDesktopLyricsFontScaleChanged(double scale)
+        {
+            if (_isClosed) return;
+            _config.DesktopLyricsFontScale = scale;
+            SaveConfig();
+        }
+
+        private void OnDesktopLyricsHiddenRequested()
+        {
+            if (_isClosed) return;
+            _config.DesktopLyricsVisible = false;
+            SyncDesktopLyrics();
+            SaveConfig();
         }
 
         private void SyncDesktopLyrics()
@@ -964,8 +1354,24 @@ namespace Lumen.UI
 
                 if (_player.HasTrack)
                 {
-                    _desktopLyrics.SetLyrics(Lyrics.LyricsFinder.Find(
-                        _player.CurrentPath, _player.DurationSeconds));
+                    // 直接复用缓存歌词，不在 UI 线程同步读盘
+                    if (_currentLyrics != null &&
+                        string.Equals(_currentLyricsPath, _player.CurrentPath, StringComparison.OrdinalIgnoreCase))
+                    {
+                        _desktopLyrics.SetLyrics(_currentLyrics);
+                        _desktopLyrics.SetPlaying(_player.IsPlaying);
+                        if (_player.IsPlaying)
+                            _desktopLyrics.UpdatePosition(_player.PositionSeconds);
+                    }
+                    else
+                    {
+                        LoadLyricsFor(_player.CurrentPath);
+                    }
+                }
+                else
+                {
+                    _desktopLyrics.SetLyrics(null);
+                    _desktopLyrics.SetPlaying(false);
                 }
             }
             else
@@ -993,11 +1399,16 @@ namespace Lumen.UI
         {
             if (!double.IsNaN(_config.WindowLeft) && !double.IsNaN(_config.WindowTop))
             {
-                // 检查是否还在可见的屏幕范围内
-                var left = _config.WindowLeft;
-                var top = _config.WindowTop;
-                if (left > -32000 && top > -32000 && left < SystemParameters.VirtualScreenWidth &&
-                    top < SystemParameters.VirtualScreenHeight)
+                // 结合 VirtualScreenLeft/Top 支持多屏负坐标校验
+                double left = _config.WindowLeft;
+                double top = _config.WindowTop;
+                double vLeft = SystemParameters.VirtualScreenLeft;
+                double vTop = SystemParameters.VirtualScreenTop;
+                double vRight = vLeft + SystemParameters.VirtualScreenWidth;
+                double vBottom = vTop + SystemParameters.VirtualScreenHeight;
+
+                if (left >= vLeft - 200 && left < vRight - 60 &&
+                    top >= vTop - 20 && top < vBottom - 60)
                 {
                     Left = left;
                     Top = top;
@@ -1025,19 +1436,16 @@ namespace Lumen.UI
         }
 
         /// <summary>
-        /// 保存当前分组的播放进度。
-        ///
-        /// 关键点：一旦播放自然结束，读出来的 position 会回落到 0，
-        /// 如果直接保存就会把「刚才听到 4.7 秒」这个信息抹掉。
-        /// 所以这里用 _lastKnownPosition 记录播放过程中见过的最后一个有效位置，
-        /// 只有在确实播到结尾时才按 README 归零（下次从头开始）。
+        /// 保存当前分组的播放进度。仅当当前播放曲目属于当前分组时才写回，防止跨分组污染。
+        /// 返回本次是否有实际进度变化。
         /// </summary>
-        private void SaveGroupProgress()
+        private bool SaveGroupProgress()
         {
-            if (_group == null) return;
+            if (_group == null) return false;
 
             var path = _player.CurrentPath;
-            if (string.IsNullOrEmpty(path)) return;
+            if (string.IsNullOrEmpty(path)) return false;
+            if (!GroupContainsPath(_group, path)) return false;
 
             double duration = _player.DurationSeconds;
             bool ended = _playbackEnded || IsAtEnd(_player.PositionSeconds, duration);
@@ -1055,12 +1463,22 @@ namespace Lumen.UI
                 position = live > 0.05 ? live : _lastKnownPosition;
             }
 
-            _group.LastTrackPath = path;
-            _group.LastPositionSeconds = Math.Max(0, position);
-        }
+            position = Math.Max(0, position);
 
-        private double _lastKnownPosition;
-        private bool _playbackEnded;
+            bool changed = !string.Equals(_lastSavedTrackPath, path, StringComparison.OrdinalIgnoreCase) ||
+                           Math.Abs(_lastSavedPositionSeconds - position) >= 0.5;
+
+            _group.LastTrackPath = path;
+            _group.LastPositionSeconds = position;
+
+            if (changed)
+            {
+                _lastSavedTrackPath = path;
+                _lastSavedPositionSeconds = position;
+            }
+
+            return changed;
+        }
 
         private static bool IsAtEnd(double position, double duration)
         {
@@ -1090,11 +1508,12 @@ namespace Lumen.UI
         {
             int current = _config.VolumePercent;
             int next = Math.Max(0, Math.Min(100, current + (int)Math.Round(delta * 100)));
-            if (next == current) return;
+            if (next == current && !_config.Muted) return;
 
             _config.VolumePercent = next;
             _player.Volume = next / 100f;
             _config.Muted = false;
+            _player.Muted = false;
             UpdateVolumeUi();
             SaveConfig();
         }
@@ -1126,16 +1545,77 @@ namespace Lumen.UI
 
         private void OnClosed(object sender, EventArgs e)
         {
-            try { _playbackTimer?.Stop(); } catch { }
-            try { _filler?.Cancel(); } catch { }
-            try { _mediaKeys?.Dispose(); } catch { }
+            _isClosed = true;
+            Interlocked.Increment(ref _playGeneration);
+            lock (_playQueueGate)
+            {
+                _pendingPlayRequest = null;
+            }
+
+            try { _lifetimeCts.Cancel(); } catch { }
+            try { _lifetimeCts.Dispose(); } catch { }
+
+            if (_playbackTimer != null)
+            {
+                try
+                {
+                    _playbackTimer.Stop();
+                    _playbackTimer.Tick -= OnPlaybackTimerTick;
+                }
+                catch { }
+            }
+
+            try
+            {
+                _player.PlaybackEnded -= OnPlayerPlaybackEnded;
+                _player.PlaybackFailed -= OnPlayerPlaybackFailed;
+            }
+            catch { }
+
+            if (_single != null)
+            {
+                try
+                {
+                    _single.FilesReceived -= OnSingleInstanceFilesReceived;
+                    _single.ActivationRequested -= OnSingleInstanceActivationRequested;
+                }
+                catch { }
+            }
+
+            if (_desktopLyrics != null)
+            {
+                try { UnhookDesktopLyrics(_desktopLyrics); } catch { }
+            }
+
+            if (_filler != null)
+            {
+                try
+                {
+                    _filler.BatchCompleted -= OnMetadataBatchCompleted;
+                    _filler.AllCompleted -= OnMetadataAllCompleted;
+                    _filler.Cancel();
+                }
+                catch { }
+            }
+
+            if (_mediaKeys != null)
+            {
+                try
+                {
+                    _mediaKeys.PlayPausePressed -= OnMediaKeyPlayPause;
+                    _mediaKeys.NextPressed -= OnMediaKeyNext;
+                    _mediaKeys.PrevPressed -= OnMediaKeyPrev;
+                    _mediaKeys.StopPressed -= OnMediaKeyStop;
+                    _mediaKeys.Dispose();
+                }
+                catch { }
+            }
+
             try { _player.Dispose(); } catch { }
             try { _desktopLyrics?.Close(); } catch { }
             try { _tray?.Dispose(); } catch { }
             try { _single?.Dispose(); } catch { }
         }
-
-        private bool _reallyExit;
 
         /// <summary>真正退出（托盘菜单调用）。</summary>
         public void ExitApplication()
@@ -1166,18 +1646,29 @@ namespace Lumen.UI
         private void HookSingleInstance()
         {
             if (_single == null) return;
-            _single.FilesReceived += delegate (IList<string> files)
+            _single.FilesReceived += OnSingleInstanceFilesReceived;
+            _single.ActivationRequested += OnSingleInstanceActivationRequested;
+        }
+
+        private void OnSingleInstanceFilesReceived(IList<string> files)
+        {
+            if (_isClosed) return;
+            Dispatcher.BeginInvoke(new Action(delegate
             {
-                Dispatcher.BeginInvoke(new Action(delegate
-                {
-                    OpenExternalFiles(files);
-                    SingleInstance.BringToFront(this);
-                }));
-            };
-            _single.ActivationRequested += delegate
+                if (_isClosed || Dispatcher.HasShutdownStarted) return;
+                OpenExternalFiles(files);
+                SingleInstance.BringToFront(this);
+            }));
+        }
+
+        private void OnSingleInstanceActivationRequested()
+        {
+            if (_isClosed) return;
+            Dispatcher.BeginInvoke(new Action(delegate
             {
-                Dispatcher.BeginInvoke(new Action(delegate { SingleInstance.BringToFront(this); }));
-            };
+                if (_isClosed || Dispatcher.HasShutdownStarted) return;
+                SingleInstance.BringToFront(this);
+            }));
         }
 
         // ------------------------------------------------------------------
@@ -1227,10 +1718,12 @@ namespace Lumen.UI
 
         /// <summary>
         /// 全局按键：空格=播放/暂停，←/→=快退/快进，↑/↓=调大/调小音量。
-        /// 仅当焦点不在文本输入框（如搜索框）时才生效，避免误触发。
+        /// 仅在无修饰键且焦点不在文本输入框（如搜索框）时生效，避免误触发。
         /// </summary>
         private void OnPreviewKeyDown(object sender, KeyEventArgs e)
         {
+            if (Keyboard.Modifiers != ModifierKeys.None) return;
+
             // 焦点在文本框 / 密码框等可输入控件里时，方向键与空格属于正常输入/光标操作，交给控件处理。
             var focused = Keyboard.FocusedElement as DependencyObject;
             bool listFocused = false;
@@ -1238,7 +1731,16 @@ namespace Lumen.UI
             {
                 if (focused is TextBox || focused is PasswordBox) return;
                 if (focused is ListBox || focused is ListBoxItem) listFocused = true;
-                focused = System.Windows.Media.VisualTreeHelper.GetParent(focused);
+
+                if (focused is Visual || focused is Visual3D)
+                {
+                    var visualParent = VisualTreeHelper.GetParent(focused);
+                    focused = visualParent ?? LogicalTreeHelper.GetParent(focused);
+                }
+                else
+                {
+                    focused = LogicalTreeHelper.GetParent(focused);
+                }
             }
 
             switch (e.Key)
@@ -1286,20 +1788,35 @@ namespace Lumen.UI
         private void HookMediaKeys()
         {
             _mediaKeys = new MediaKeys();
-            _mediaKeys.PlayPausePressed += delegate { TogglePlayPause(); };
-            _mediaKeys.NextPressed += delegate { PlayNext(true); };
-            _mediaKeys.PrevPressed += delegate { PlayPrevious(); };
-            _mediaKeys.StopPressed += delegate
-            {
-                _player.Stop();
-                _listPane.SetPlaying(-1);
-                UpdateBottomBar();
-            };
+            _mediaKeys.PlayPausePressed += OnMediaKeyPlayPause;
+            _mediaKeys.NextPressed += OnMediaKeyNext;
+            _mediaKeys.PrevPressed += OnMediaKeyPrev;
+            _mediaKeys.StopPressed += OnMediaKeyStop;
 
             bool ok = _mediaKeys.Register();
             Log.Info(ok
                 ? "媒体键已启用" + (_mediaKeys.FailureReason != null ? "（" + _mediaKeys.FailureReason + "）" : "")
                 : "媒体键不可用：" + _mediaKeys.FailureReason);
+        }
+
+        private void OnMediaKeyPlayPause()
+        {
+            if (!_isClosed) TogglePlayPause();
+        }
+
+        private void OnMediaKeyNext()
+        {
+            if (!_isClosed) PlayNext(true);
+        }
+
+        private void OnMediaKeyPrev()
+        {
+            if (!_isClosed) PlayPrevious();
+        }
+
+        private void OnMediaKeyStop()
+        {
+            if (!_isClosed) StopPlaybackAndClearUi(false);
         }
 
         // ------------------------------------------------------------------
@@ -1308,25 +1825,48 @@ namespace Lumen.UI
 
         private void StartPlaybackTimer()
         {
-            _playbackTimer = new System.Windows.Threading.DispatcherTimer
+            _playbackTimer = new DispatcherTimer
             {
                 Interval = TimeSpan.FromMilliseconds(120)
             };
-            _playbackTimer.Tick += delegate { TickPlayback(); };
-            _playbackTimer.Start();
+            _playbackTimer.Tick += OnPlaybackTimerTick;
+            SyncPlaybackTimerState();
         }
 
-        private DateTime _lastProgressSave = DateTime.UtcNow;
+        private void SyncPlaybackTimerState()
+        {
+            if (_playbackTimer == null || _isClosed) return;
+
+            if (_player.IsPlaying)
+            {
+                if (_playbackTimer.Interval != TimeSpan.FromMilliseconds(120))
+                    _playbackTimer.Interval = TimeSpan.FromMilliseconds(120);
+                if (!_playbackTimer.IsEnabled)
+                    _playbackTimer.Start();
+            }
+            else
+            {
+                if (_playbackTimer.IsEnabled)
+                    _playbackTimer.Stop();
+            }
+        }
+
+        private void OnPlaybackTimerTick(object sender, EventArgs e)
+        {
+            if (_isClosed) return;
+            TickPlayback();
+        }
 
         private void TickPlayback()
         {
             try
             {
-                if (!_player.HasTrack)
+                if (!_player.HasTrack || !_player.IsPlaying)
                 {
                     UpdateBottomBar();
                     if (_desktopLyrics != null && _config.DesktopLyricsVisible)
                         _desktopLyrics.SetPlaying(false);
+                    SyncPlaybackTimerState();
                     return;
                 }
 
@@ -1335,30 +1875,30 @@ namespace Lumen.UI
 
                 // 记录播放过程中见过的最后一个有效位置：
                 // 播放结束后 position 会回落，靠它才能保住进度
-                if (_player.IsPlaying && position > 0.05)
+                if (position > 0.05)
                 {
                     _lastKnownPosition = position;
                     _playbackEnded = IsAtEnd(position, duration);
                 }
 
                 _bottomBar.SetTimeline(position, duration, true);
-                _bottomBar.SetPlaying(_player.IsPlaying);
+                _bottomBar.SetPlaying(true);
                 _lyricsPane.UpdatePosition(position, true);
 
                 if (_desktopLyrics != null && _config.DesktopLyricsVisible)
                 {
-                    _desktopLyrics.SetPlaying(_player.IsPlaying);
-                    if (_player.IsPlaying)
-                        _desktopLyrics.UpdatePosition(position);
+                    _desktopLyrics.SetPlaying(true);
+                    _desktopLyrics.UpdatePosition(position);
                 }
 
-
-                // 分组进度定期落盘（每 5 秒），避免频繁写文件
+                // 分组进度定期落盘（每 5 秒），且仅在进度有实际变化时才写盘
                 if ((DateTime.UtcNow - _lastProgressSave).TotalSeconds >= 5)
                 {
                     _lastProgressSave = DateTime.UtcNow;
-                    SaveGroupProgress();
-                    _config.SaveAsync();
+                    if (SaveGroupProgress())
+                    {
+                        _config.SaveAsync();
+                    }
                 }
             }
             catch (Exception ex)
@@ -1368,10 +1908,10 @@ namespace Lumen.UI
         }
 
         // ------------------------------------------------------------------
-        // 启动时恢复每个分组各自的播放进度
+        // 启动时/切换分组时恢复播放进度
         // ------------------------------------------------------------------
 
-        private void RestoreGroupProgress()
+        private void RestoreGroupProgress(bool scrollToPlaying)
         {
             if (_group == null || string.IsNullOrEmpty(_group.LastTrackPath)) return;
             if (!System.IO.File.Exists(_group.LastTrackPath))
@@ -1389,16 +1929,23 @@ namespace Lumen.UI
                     _currentIndex = IndexOfPath(_group.LastTrackPath);
                     _lastKnownPosition = _group.LastPositionSeconds;
                     _playbackEnded = false;
+                    _lastSavedTrackPath = _group.LastTrackPath;
+                    _lastSavedPositionSeconds = _group.LastPositionSeconds;
                     _listPane.SetPlaying(_currentIndex);
                     LoadLyricsFor(_group.LastTrackPath);
                     UpdateBottomBar();
                     _bottomBar.SetPlaying(false);
+                    SyncPlaybackTimerState();
 
-                    // 打开时定位到当前播放位置（等布局完成后再滚动）
-                    Dispatcher.BeginInvoke(new Action(delegate
+                    if (scrollToPlaying)
                     {
-                        _listPane.ScrollToPlaying();
-                    }), System.Windows.Threading.DispatcherPriority.Loaded);
+                        // 打开时定位到当前播放位置（等布局完成后再滚动）
+                        Dispatcher.BeginInvoke(new Action(delegate
+                        {
+                            if (_isClosed || Dispatcher.HasShutdownStarted) return;
+                            _listPane.ScrollToPlaying();
+                        }), DispatcherPriority.Loaded);
+                    }
 
                     Log.Info(string.Format("已恢复分组「{0}」的进度: {1} @ {2:0.0}s",
                         _group.Name,
@@ -1418,41 +1965,143 @@ namespace Lumen.UI
         /// </summary>
         public void OpenExternalFiles(IList<string> files)
         {
-            if (files == null || files.Count == 0) return;
+            if (_isClosed || files == null || files.Count == 0) return;
 
-            var pending = new List<Track>();
+            Track firstExisting = null;
+            Group firstExistingOwner = null;
+            bool firstTargetIsExisting = false;
+            bool firstTargetResolved = false;
 
+            var toScan = new List<string>();
             foreach (var path in files)
             {
+                if (string.IsNullOrWhiteSpace(path)) continue;
+
                 var found = FindTrackInLibrary(path);
                 if (found != null)
                 {
-                    // 切到它所在的分组、选中它
-                    var owner = FindGroupOfTrack(found);
-                    if (owner != null && owner.Id != _config.CurrentGroupId)
+                    if (!firstTargetResolved)
                     {
-                        SaveGroupProgress();
-                        _config.CurrentGroupId = owner.Id;
-                        ApplyGroup(owner, false);
+                        firstTargetResolved = true;
+                        firstTargetIsExisting = true;
                     }
-                    PlayTrack(found);
+                    if (firstExisting == null)
+                    {
+                        firstExisting = found;
+                        firstExistingOwner = FindGroupOfTrack(found);
+                    }
                     continue;
                 }
 
-                var order = NextAddedOrder();
-                var scanned = MediaScanner.FromFiles(new[] { path }, ref order);
-                pending.AddRange(scanned);
+                if (!firstTargetResolved)
+                {
+                    firstTargetResolved = true;
+                    firstTargetIsExisting = false;
+                }
+                toScan.Add(path);
             }
 
-            if (pending.Count == 0) return;
+            if (toScan.Count == 0)
+            {
+                if (firstExisting != null)
+                {
+                    if (firstExistingOwner != null && firstExistingOwner.Id != _config.CurrentGroupId)
+                    {
+                        SaveGroupProgress();
+                        _config.CurrentGroupId = firstExistingOwner.Id;
+                        ApplyGroup(firstExistingOwner, false);
+                    }
+                    PlayTrack(firstExisting);
+                }
+                return;
+            }
 
-            var group = _config.FindGroupByName("打开的文件") ?? CreateOpenFilesGroup();
-            _config.CurrentGroupId = group.Id;
-            ApplyGroup(group, false);
-            AddTracks(pending);
-            _filler.Enqueue(pending);
-            if (pending.Count > 0) PlayTrack(_view[0]);
-            SaveConfig();
+            var token = _lifetimeCts.Token;
+            _listPane.FlashStatus("正在打开外部文件…");
+
+            ThreadPool.QueueUserWorkItem(delegate
+            {
+                if (token.IsCancellationRequested || _isClosed) return;
+
+                List<Track> pending;
+                try
+                {
+                    int scanOrder = 0;
+                    pending = MediaScanner.FromFiles(toScan, ref scanOrder);
+                }
+                catch (Exception ex)
+                {
+                    Log.Error("扫描外部文件失败", ex);
+                    pending = new List<Track>();
+                }
+
+                if (token.IsCancellationRequested || _isClosed) return;
+
+                Dispatcher.BeginInvoke(new Action(delegate
+                {
+                    if (_isClosed || Dispatcher.HasShutdownStarted) return;
+
+                    if (pending.Count == 0)
+                    {
+                        _listPane.FlashStatus("");
+                        if (firstExisting != null)
+                        {
+                            if (firstExistingOwner != null &&
+                                _config.Groups.Contains(firstExistingOwner) &&
+                                firstExistingOwner.Id != _config.CurrentGroupId)
+                            {
+                                SaveGroupProgress();
+                                _config.CurrentGroupId = firstExistingOwner.Id;
+                                ApplyGroup(firstExistingOwner, false);
+                            }
+                            PlayTrack(firstExisting);
+                        }
+                        return;
+                    }
+
+                    // 循环外统一递增 AddedOrder
+                    int nextOrder = NextAddedOrder();
+                    for (int i = 0; i < pending.Count; i++) pending[i].AddedOrder = nextOrder++;
+
+                    var openGroup = _config.FindGroupByName("打开的文件") ?? CreateOpenFilesGroup();
+                    AddTracksToGroup(openGroup, pending);
+                    _filler.Enqueue(pending);
+
+                    if (firstTargetIsExisting && firstExisting != null &&
+                        firstExistingOwner != null && _config.Groups.Contains(firstExistingOwner))
+                    {
+                        if (firstExistingOwner.Id != _config.CurrentGroupId)
+                        {
+                            SaveGroupProgress();
+                            _config.CurrentGroupId = firstExistingOwner.Id;
+                            ApplyGroup(firstExistingOwner, false);
+                        }
+                        PlayTrack(firstExisting);
+                    }
+                    else
+                    {
+                        if (openGroup.Id != _config.CurrentGroupId)
+                        {
+                            SaveGroupProgress();
+                            _config.CurrentGroupId = openGroup.Id;
+                            ApplyGroup(openGroup, false);
+                        }
+                        else
+                        {
+                            RebuildView();
+                        }
+
+                        // 仅对首个目标曲目调用一次 PlayTrack（播放 pending[0] 而非 _view[0]）
+                        Track targetTrack = pending[0];
+                        int idx = IndexOfPath(targetTrack.Path);
+                        if (idx >= 0 && idx < _view.Count) targetTrack = _view[idx];
+                        PlayTrack(targetTrack);
+                    }
+
+                    SaveConfig();
+                    _listPane.FlashStatus("");
+                }), DispatcherPriority.Background);
+            });
         }
 
         private Group CreateOpenFilesGroup()

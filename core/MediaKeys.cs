@@ -1,7 +1,9 @@
-﻿using System;
+using System;
+using System.Collections.Generic;
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
+using System.Windows.Threading;
 
 namespace Lumen
 {
@@ -16,6 +18,7 @@ namespace Lumen
     public sealed class MediaKeys : IDisposable
     {
         private const int WM_HOTKEY = 0x0312;
+        private static readonly IntPtr HWND_MESSAGE = new IntPtr(-3);
 
         // 热键 ID
         private const int IdPlayPause = 0x4C01;
@@ -29,7 +32,9 @@ namespace Lumen
         private const uint VK_MEDIA_PLAY_PAUSE = 0xB3;
         private const uint MOD_NOREPEAT = 0x4000;
 
+        private readonly HashSet<int> _registeredIds = new HashSet<int>();
         private HwndSource _source;
+        private Dispatcher _dispatcher;
         private IntPtr _handle = IntPtr.Zero;
         private bool _registered;
 
@@ -45,35 +50,38 @@ namespace Lumen
         public event Action StopPressed;
 
         /// <summary>
-        /// 创建隐藏消息窗口并注册媒体键。返回是否成功。
+        /// 创建纯消息窗口并注册媒体键。返回是否成功。
         /// </summary>
         public bool Register()
         {
+            Dispose();
+            FailureReason = null;
+
             try
             {
-                // 用一个隐藏的 HwndSource 接收 WM_HOTKEY
+                // 使用 HWND_MESSAGE 创建纯消息窗口接收 WM_HOTKEY
                 var parameters = new HwndSourceParameters("LumenMediaKeySink")
                 {
                     Width = 0,
                     Height = 0,
-                    PositionX = -10000,
-                    PositionY = -10000,
-                    WindowStyle = 0,          // 不可见
-                    ExtendedWindowStyle = 0x00000080  // WS_EX_TOOLWINDOW
+                    ParentWindow = HWND_MESSAGE,
+                    WindowStyle = 0
                 };
 
                 _source = new HwndSource(parameters);
+                _dispatcher = _source.Dispatcher;
                 _source.AddHook(WndProc);
                 _handle = _source.Handle;
 
                 if (_handle == IntPtr.Zero)
                 {
+                    Dispose();
                     FailureReason = "无法创建消息窗口";
                     return false;
                 }
 
                 int ok = 0;
-                var failed = new System.Collections.Generic.List<string>();
+                var failed = new List<string>();
 
                 if (TryRegister(IdPlayPause, VK_MEDIA_PLAY_PAUSE)) ok++;
                 else failed.Add("播放/暂停");
@@ -89,9 +97,9 @@ namespace Lumen
 
                 if (ok == 0)
                 {
-                    FailureReason = "已被其他程序占用";
-                    _registered = false;
                     Log.Warn("媒体键注册失败：全部被占用（可能被别的播放器占用）");
+                    Dispose();
+                    FailureReason = "已被其他程序占用";
                     return false;
                 }
 
@@ -103,9 +111,9 @@ namespace Lumen
             }
             catch (Exception ex)
             {
-                FailureReason = ex.Message;
-                _registered = false;
                 Log.Error("媒体键注册异常", ex);
+                Dispose();
+                FailureReason = ex.Message;
                 return false;
             }
         }
@@ -113,7 +121,11 @@ namespace Lumen
         private bool TryRegister(int id, uint vk)
         {
             bool ok = Native.Win32.RegisterHotKey(_handle, id, MOD_NOREPEAT, vk);
-            if (!ok)
+            if (ok)
+            {
+                _registeredIds.Add(id);
+            }
+            else
             {
                 int error = Marshal.GetLastWin32Error();
                 Log.Warn("媒体键 0x" + vk.ToString("X2") + " 注册失败，错误码 " + error +
@@ -126,15 +138,27 @@ namespace Lumen
         {
             if (msg != WM_HOTKEY) return IntPtr.Zero;
 
-            int id = wParam.ToInt32();
             try
             {
+                int id = unchecked((int)wParam.ToInt64());
                 switch (id)
                 {
-                    case IdPlayPause: Raise(PlayPausePressed); break;
-                    case IdNext: Raise(NextPressed); break;
-                    case IdPrev: Raise(PrevPressed); break;
-                    case IdStop: Raise(StopPressed); break;
+                    case IdPlayPause:
+                        handled = true;
+                        Raise(PlayPausePressed);
+                        break;
+                    case IdNext:
+                        handled = true;
+                        Raise(NextPressed);
+                        break;
+                    case IdPrev:
+                        handled = true;
+                        Raise(PrevPressed);
+                        break;
+                    case IdStop:
+                        handled = true;
+                        Raise(StopPressed);
+                        break;
                 }
             }
             catch (Exception ex)
@@ -142,7 +166,6 @@ namespace Lumen
                 Log.Error("处理媒体键失败", ex);
             }
 
-            handled = true;
             return IntPtr.Zero;
         }
 
@@ -158,17 +181,40 @@ namespace Lumen
 
         public void Dispose()
         {
+            var dispatcher = _dispatcher;
+            if (dispatcher != null && !dispatcher.CheckAccess())
+            {
+                try
+                {
+                    if (!dispatcher.HasShutdownStarted && !dispatcher.HasShutdownFinished)
+                    {
+                        dispatcher.Invoke(DisposeOnOwnerThread);
+                        return;
+                    }
+                }
+                catch { }
+            }
+
+            DisposeOnOwnerThread();
+        }
+
+        private void DisposeOnOwnerThread()
+        {
             try
             {
-                if (_handle != IntPtr.Zero)
+                if (_handle != IntPtr.Zero && _registeredIds.Count > 0)
                 {
-                    Native.Win32.UnregisterHotKey(_handle, IdPlayPause);
-                    Native.Win32.UnregisterHotKey(_handle, IdNext);
-                    Native.Win32.UnregisterHotKey(_handle, IdPrev);
-                    Native.Win32.UnregisterHotKey(_handle, IdStop);
+                    foreach (var id in _registeredIds)
+                    {
+                        try { Native.Win32.UnregisterHotKey(_handle, id); } catch { }
+                    }
                 }
             }
             catch { }
+            finally
+            {
+                _registeredIds.Clear();
+            }
 
             try
             {
@@ -182,6 +228,7 @@ namespace Lumen
             catch { }
 
             _handle = IntPtr.Zero;
+            _dispatcher = null;
             _registered = false;
         }
     }
